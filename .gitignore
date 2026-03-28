@@ -11,3 +11,9 @@ data/
 *.h5
 *.xml
 *.log
+*.vtk
+*.png
+*.pdf
+*.dat
+*.csv
+*.geo
