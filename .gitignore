@@ -17,3 +17,5 @@ data/
 *.dat
 *.csv
 *.geo
+*.json
+*.pkl

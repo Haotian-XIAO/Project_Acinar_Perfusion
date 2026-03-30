@@ -785,7 +785,7 @@ patch_specs = [
 ]
 
 generate_2D_voronoi_with_thickness_rect(
-    mesh_filename="with_airway",
+    mesh_filename="mesh/Mesh_Acinar_Perfusion_2D",
     seeds_filename="seeds-2D-periodic.dat",
     domain_x=1.0,
     domain_y=1.0,
