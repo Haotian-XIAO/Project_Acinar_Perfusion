@@ -15,7 +15,53 @@ import matplotlib.pyplot as plt
 
 #######################################################################
 
+def convert_msh_to_xdmf_with_domains(mesh_filename, dim=2):
+    import meshio
+    import numpy as np
 
+    msh = meshio.read(mesh_filename + ".msh")
+
+    if dim == 2:
+        cell_type = "triangle"
+    elif dim == 3:
+        cell_type = "tetra"
+    else:
+        raise ValueError("dim must be 2 or 3")
+
+    # points
+    points = msh.points[:, :2] if dim == 2 else msh.points
+
+    # cells
+    cells = msh.get_cells_type(cell_type)
+    if len(cells) == 0:
+        raise ValueError(f"No cells of type '{cell_type}' found in {mesh_filename}.msh")
+
+    # main mesh
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[(cell_type, cells)]
+    )
+    meshio.write(mesh_filename + ".xdmf", mesh)
+
+    # physical group data for domains
+    physical = None
+    if "gmsh:physical" in msh.cell_data_dict:
+        if cell_type in msh.cell_data_dict["gmsh:physical"]:
+            physical = msh.cell_data_dict["gmsh:physical"][cell_type]
+
+    if physical is None:
+        print("[Warning] No gmsh:physical data found for cell domains.")
+        return
+
+    domains = meshio.Mesh(
+        points=points,
+        cells=[(cell_type, cells)],
+        cell_data={"domains": [np.array(physical, dtype=np.int32)]}
+    )
+    meshio.write(mesh_filename + "_domains.xdmf", domains)
+
+    print(f"[OK] Wrote {mesh_filename}.xdmf")
+    print(f"[OK] Wrote {mesh_filename}_domains.xdmf")
 
 def build_row_col_map_for_selected_cells(cell_metadata, selected_indices, y_tol=None):
     """
@@ -448,7 +494,8 @@ def generate_2D_voronoi_with_thickness_rect(
 
         cell_rc_map = build_row_col_map_for_selected_cells(
             cell_metadata,
-            selected_indices=full_cell_indices
+            selected_indices=full_cell_indices,
+            y_tol=0.1
         )
 
         # compute patch centers
@@ -523,15 +570,26 @@ def generate_2D_voronoi_with_thickness_rect(
 
     # ------------------ Save metadata ------------------
     if save_metadata:
+        kept_indices = filter_full_cells_in_rect(
+            cell_metadata,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=ymax
+        )
+
+        cell_metadata_rect = [cell_metadata[i] for i in kept_indices]
+
         metadata_pkl = mesh_filename + "_cell_metadata.pkl"
         metadata_json = mesh_filename + "_cell_metadata.json"
 
         with open(metadata_pkl, "wb") as f:
-            pickle.dump(cell_metadata, f)
+            pickle.dump(cell_metadata_rect, f)
 
         with open(metadata_json, "w") as f:
-            json.dump(cell_metadata, f, indent=2)
+            json.dump(cell_metadata_rect, f, indent=2)
 
+        print(f"[SAVE] Saved {len(cell_metadata_rect)} cells inside rectangle.")
         print(f"[SAVE] Cell metadata saved to {metadata_pkl}")
         print(f"[SAVE] Cell metadata saved to {metadata_json}")
 
@@ -544,63 +602,10 @@ def generate_2D_voronoi_with_thickness_rect(
         gmsh.model.mesh.refine()
 
     gmsh.write(mesh_filename + ".msh")
-    gmsh.write(mesh_filename + ".vtk")
-
     gmsh.finalize()
 
-    convert_vtk_to_xdmf(mesh_filename, dim=2)
-    print(f"[DONE] Mesh saved as {mesh_filename}.msh/.vtk/.xdmf")
-def build_row_col_map(cell_metadata, y_tol=None):
-    """
-    Build a map from (row, col) -> cell index in cell_metadata.
-
-    Row numbering:
-        1 = top row
-        2 = second row
-        ...
-    Col numbering:
-        left to right within each row
-    """
-    centers = np.array([cell["center"] for cell in cell_metadata], dtype=float)
-
-    # sort by y descending to define rows from top to bottom
-    y_vals = centers[:, 1]
-
-    if y_tol is None:
-        # heuristic tolerance
-        y_sorted = np.sort(y_vals)
-        if len(y_sorted) > 1:
-            dy = np.diff(y_sorted)
-            dy = dy[dy > 1e-12]
-            if len(dy) > 0:
-                y_tol = 0.5 * np.median(dy)
-            else:
-                y_tol = 1e-6
-        else:
-            y_tol = 1e-6
-
-    # cluster rows by y
-    idx_sorted = np.argsort(-y_vals)  # descending y
-    rows = []
-    current_row = [idx_sorted[0]]
-
-    for idx in idx_sorted[1:]:
-        y_ref = centers[current_row[0], 1]
-        if abs(centers[idx, 1] - y_ref) < y_tol:
-            current_row.append(idx)
-        else:
-            rows.append(current_row)
-            current_row = [idx]
-    rows.append(current_row)
-
-    # within each row, sort by x ascending
-    cell_rc_map = {}
-    for i_row, row_indices in enumerate(rows, start=1):
-        row_indices = sorted(row_indices, key=lambda k: centers[k, 0])
-        for i_col, idx in enumerate(row_indices, start=1):
-            cell_rc_map[(i_row, i_col)] = idx
-
-    return cell_rc_map
+    convert_msh_to_xdmf_with_domains(mesh_filename, dim=2)
+    print(f"[DONE] Mesh saved as {mesh_filename}.msh/.xdmf/.xdmf_domains")
 
 def find_surface_closest_to_point(surface_tags, point):
     x0, y0 = point
@@ -616,22 +621,48 @@ def find_surface_closest_to_point(surface_tags, point):
 
     return best_tag, best_dist
 
+def side_to_ref_angle_deg(side):
+    directions = {
+        "right":         0.0,
+        "top_right":    60.0,
+        "top_left":    120.0,
+        "left":        180.0,
+        "bottom_left": -120.0,
+        "bottom_right": -60.0,
+    }
+    if side not in directions:
+        raise ValueError(f"Unknown side: {side}")
+    return directions[side]
+
 def get_edge_by_side(cell, side):
-    """
-    side can be int (1..6) or str
-    """
-    if isinstance(side, int):
-        matches = [e for e in cell["edges"] if e["side_id"] == side]
-    else:
-        matches = [e for e in cell["edges"] if e["side"] == side]
+    cx, cy = cell["center"]
+    ref_deg = side_to_ref_angle_deg(side)
 
-    if len(matches) == 0:
-        raise RuntimeError(f"No edge found for side={side} in cell_id={cell['cell_id']}")
+    best_edge = None
+    best_diff = 1e30
 
-    if len(matches) > 1:
-        print(f"Warning: multiple edges found for side={side} in cell_id={cell['cell_id']}, using first one.")
+    for e in cell["edges"]:
+        mx, my = e["midpoint_wall"]
+        theta = math.atan2(my - cy, mx - cx)
+        deg = math.degrees(theta)
 
-    return matches[0]
+        while deg >= 180.0:
+            deg -= 360.0
+        while deg < -180.0:
+            deg += 360.0
+
+        diff = angle_diff_deg(deg, ref_deg)
+
+        if diff < best_diff:
+            best_diff = diff
+            best_edge = e
+
+    if best_edge is None:
+        raise RuntimeError(
+            f"No edge found for side={side} in cell_id={cell['cell_id']}"
+        )
+
+    return best_edge
 
 def compute_patch_center_from_cell_edge(cell, side, offset_along_wall=0.0):
     """
@@ -707,29 +738,36 @@ def build_patch_centers_from_specs(cell_metadata, cell_rc_map, patch_specs, offs
 
     return patch_data
 
-def generate_hexagonal_seeds_with_periodicity_2D(grid_x, grid_y, domain_x, domain_y, DoI, seeds_filename="hexagonal_seeds-2D-periodic.dat"):
-    """
-    Generate 2D hexagonal lattice seeds with periodic neighbors and disorder.
-    """
+def generate_hexagonal_seeds_with_periodicity_2D(
+    grid_x, grid_y, domain_x, domain_y, DoI,
+    seeds_filename="hexagonal_seeds-2D-periodic.dat"
+):
+    import numpy as np
+    import pickle
 
-    # Hexagonal lattice spacing
     cell_x = domain_x / grid_x
-    cell_y = domain_y / (grid_y * np.sqrt(3) / 2)  # Adjust for vertical spacing in hex packing
+    y_spacing = domain_y / grid_y
 
     seeds = []
 
-    for i in range(grid_x):
-        for j in range(grid_y):
-            # Stagger every other row (hexagonal packing)
-            offset_x = (cell_x / 2) if j % 2 == 1 else 0
+    for j in range(grid_y):
+        for i in range(grid_x):
+            offset_x = 0.5 * cell_x if (j % 2 == 1) else 0.0
 
-            x = i * cell_x + offset_x + (np.random.random() - 0.5) * cell_x * DoI
-            y = j * cell_y * np.sqrt(3) / 2 + (np.random.random() - 0.5) * cell_y * DoI
+            x0 = i * cell_x + offset_x
+            y0 = j * y_spacing
 
-            if 0 <= x <= domain_x and 0 <= y <= domain_y:
-                seeds.append([x, y])
+            x = x0 + (np.random.random() - 0.5) * cell_x * DoI
+            y = y0 + (np.random.random() - 0.5) * y_spacing * DoI
 
-    # Add periodic neighbors (8 neighbors: surrounding tiles)
+            # periodic wrap instead of discard
+            x = x % domain_x
+            y = y % domain_y
+
+            seeds.append([x, y])
+
+    seeds = np.array(seeds, dtype=float)
+
     periodic_neighbors = []
     shifts = [
         (sx * domain_x, sy * domain_y)
@@ -739,23 +777,23 @@ def generate_hexagonal_seeds_with_periodicity_2D(grid_x, grid_y, domain_x, domai
     ]
 
     for dx, dy in shifts:
-        for s in seeds:
-            periodic_neighbors.append([s[0] + dx, s[1] + dy])
+        periodic_neighbors.append(seeds + np.array([dx, dy]))
 
-    all_seeds = np.array(seeds + periodic_neighbors)
+    all_seeds = np.vstack([seeds] + periodic_neighbors)
 
-    # Save seeds
     with open(seeds_filename, "wb") as f:
         pickle.dump(all_seeds, f)
 
-    print(f"Generated {len(all_seeds)} seeds (including periodic neighbors) and saved to {seeds_filename}")
-    return all_seeds
+    print(f"Generated {len(seeds)} base seeds")
+    print(f"Generated {len(all_seeds)} seeds including periodic neighbors")
+    print(f"Saved to {seeds_filename}")
 
+    return all_seeds
 # Parameters
 epsilon = 0.0
 domain_x, domain_y = 1.0 + epsilon, 1.0 + epsilon
 grid_x, grid_y = 6, 6
-DoI = 0.0  # Degree of Irregularity (0 = perfect lattice)
+DoI = 0.3  # Degree of Irregularity (0 = perfect lattice)
 thickness = 0.02
 lcar = 0.01
 
@@ -778,11 +816,12 @@ seeds = generate_hexagonal_seeds_with_periodicity_2D(
 
 vor = Voronoi(seeds)
 
-patch_specs = [
-    {"row": 3, "col": 3, "side": "top_left",     "kind": "inlet"},
-    {"row": 4, "col": 5, "side": "bottom_left",  "kind": "outlet"},
-    {"row": 5, "col": 2, "side": "bottom_right", "kind": "outlet"},
-]
+patch_specs =     [
+        {"row": 1, "col": 2, "side": "top_left", "kind": "inlet"},
+        {"row": 2, "col": 4, "side": "top_left", "kind": "outlet"},
+        {"row": 4, "col": 1, "side": "bottom_left", "kind": "outlet"},
+        {"row": 5, "col": 4, "side": "bottom_right", "kind": "inlet"},
+    ]
 
 generate_2D_voronoi_with_thickness_rect(
     mesh_filename="mesh/Mesh_Acinar_Perfusion_2D",
@@ -794,5 +833,5 @@ generate_2D_voronoi_with_thickness_rect(
     patch_specs=patch_specs,
     patch_offset=0.02,
     patch_radius=0.003,
-    n_refine=2,
+    n_refine=1,
 )
