@@ -495,7 +495,7 @@ def generate_2D_voronoi_with_thickness_rect(
         cell_rc_map = build_row_col_map_for_selected_cells(
             cell_metadata,
             selected_indices=full_cell_indices,
-            y_tol=0.1
+            y_tol=0.03
         )
 
         # compute patch centers
@@ -792,7 +792,8 @@ def generate_hexagonal_seeds_with_periodicity_2D(
 # Parameters
 epsilon = 0.0
 domain_x, domain_y = 1.0 + epsilon, 1.0 + epsilon
-grid_x, grid_y = 6, 6
+#grid_x, grid_y = 6, 6
+grid_x, grid_y = 12, 12
 DoI = 0.3  # Degree of Irregularity (0 = perfect lattice)
 thickness = 0.02
 lcar = 0.01
@@ -816,12 +817,63 @@ seeds = generate_hexagonal_seeds_with_periodicity_2D(
 
 vor = Voronoi(seeds)
 
-patch_specs =     [
-        {"row": 1, "col": 2, "side": "top_left", "kind": "inlet"},
-        {"row": 2, "col": 4, "side": "top_left", "kind": "outlet"},
-        {"row": 4, "col": 1, "side": "bottom_left", "kind": "outlet"},
-        {"row": 5, "col": 4, "side": "bottom_right", "kind": "inlet"},
-    ]
+# patch_specs =     [
+#         {"row": 1, "col": 2, "side": "top_left", "kind": "inlet"},
+#         {"row": 2, "col": 4, "side": "top_left", "kind": "outlet"},
+#         {"row": 4, "col": 1, "side": "bottom_left", "kind": "outlet"},
+#         {"row": 5, "col": 4, "side": "bottom_right", "kind": "inlet"},
+#     ]
+
+#top/bottom rows
+patch_specs = [
+    {"row": 1,  "col": 2,  "side": "top_left",     "kind": "inlet"},
+    {"row": 1,  "col": 4,  "side": "top_left",     "kind": "inlet"},
+    {"row": 1,  "col": 6,  "side": "top_left",     "kind": "inlet"},
+    {"row": 1,  "col": 8,  "side": "top_left",     "kind": "inlet"},
+    {"row": 1,  "col": 10, "side": "top_left",     "kind": "inlet"},
+
+    {"row": 11, "col": 2,  "side": "bottom_right", "kind": "outlet"},
+    {"row": 11, "col": 4,  "side": "bottom_right", "kind": "outlet"},
+    {"row": 11, "col": 6,  "side": "bottom_right", "kind": "outlet"},
+    {"row": 11, "col": 8,  "side": "bottom_right", "kind": "outlet"},
+    {"row": 11, "col": 10, "side": "bottom_right", "kind": "outlet"},
+]
+
+
+## center
+# patch_specs = [
+#     {"row": 5, "col": 6, "side": "top_left",     "kind": "inlet"},
+#     {"row": 5, "col": 7, "side": "top_right",    "kind": "inlet"},
+#     {"row": 6, "col": 6, "side": "bottom_left",  "kind": "inlet"},
+#     {"row": 6, "col": 7, "side": "bottom_right", "kind": "inlet"},
+
+#     {"row": 1,  "col": 3,  "side": "top_left",     "kind": "outlet"},
+#     {"row": 1,  "col": 9,  "side": "top_left",     "kind": "outlet"},
+#     {"row": 3,  "col": 1,  "side": "bottom_left",  "kind": "outlet"},
+#     {"row": 8,  "col": 1,  "side": "bottom_left",  "kind": "outlet"},
+#     {"row": 3,  "col": 10, "side": "top_right",    "kind": "outlet"},
+#     {"row": 8,  "col": 10, "side": "top_right",    "kind": "outlet"},
+#     {"row": 10, "col": 3,  "side": "bottom_right", "kind": "outlet"},
+#     {"row": 10, "col": 9,  "side": "bottom_right", "kind": "outlet"},
+# ]
+
+
+# random
+# patch_specs = [
+#     {"row": 1,  "col": 2,  "side": "top_left",     "kind": "inlet"},
+#     {"row": 1,  "col": 10, "side": "top_left",     "kind": "outlet"},
+#     {"row": 3,  "col": 5,  "side": "bottom_left",  "kind": "outlet"},
+#     {"row": 3,  "col": 8, "side": "top_right",    "kind": "inlet"},
+#     {"row": 6,  "col": 1,  "side": "bottom_left",  "kind": "inlet"},
+#     {"row": 6,  "col": 10, "side": "top_right",    "kind": "outlet"},
+#     {"row": 9,  "col": 3,  "side": "bottom_left",  "kind": "outlet"},
+#     {"row": 9,  "col": 7, "side": "top_right",    "kind": "inlet"},
+#     {"row": 11, "col": 3,  "side": "bottom_right", "kind": "inlet"},
+#     {"row": 11, "col": 10, "side": "bottom_right", "kind": "outlet"},
+# ]
+import time
+
+t0 = time.perf_counter()
 
 generate_2D_voronoi_with_thickness_rect(
     mesh_filename="mesh/Mesh_Acinar_Perfusion_2D",
@@ -835,3 +887,6 @@ generate_2D_voronoi_with_thickness_rect(
     patch_radius=0.003,
     n_refine=1,
 )
+
+t1 = time.perf_counter()
+print(f"Mesh generation time: {t1 - t0:.6f} s")
