@@ -792,8 +792,8 @@ def generate_hexagonal_seeds_with_periodicity_2D(
 # Parameters
 epsilon = 0.0
 domain_x, domain_y = 1.0 + epsilon, 1.0 + epsilon
-#grid_x, grid_y = 6, 6
-grid_x, grid_y = 12, 12
+grid_x, grid_y = 8, 8
+#grid_x, grid_y = 12, 12
 DoI = 0.3  # Degree of Irregularity (0 = perfect lattice)
 thickness = 0.02
 lcar = 0.01

@@ -1,0 +1,1075 @@
+#coding=utf8
+
+################################################################################
+###                                                                          ###
+### Created by Mahdi Manoochehrtayebi, 2020-2024                             ###
+###                                                                          ###
+### École Polytechnique, Palaiseau, France                                   ###
+###                                                                          ###
+###                                                                          ###
+### And Martin Genet, 2018-2025                                              ###
+###                                                                          ###
+### École Polytechnique, Palaiseau, France                                   ###
+###                                                                          ###
+###                                                                          ###
+### And Haotian XIAO, 2024-2027                                              ###
+###                                                                          ###
+### École Polytechnique, Palaiseau, France                                   ###
+###                                                                          ###
+################################################################################
+
+import dolfin
+import gmsh
+import meshio
+import numpy
+import math
+
+import dolfin_mech as dmech
+
+import gmsh
+import meshio
+import dolfin
+import numpy
+
+import gmsh
+import meshio
+import dolfin
+import numpy as np
+import math
+
+################################################################################
+
+def setPeriodic(dim, coord, xmin, ymin, zmin, xmax, ymax, zmax, e=1e-6):
+    # From https://gitlab.onelab.info/gmsh/gmsh/-/issues/744
+
+    dx = (xmax - xmin) if (coord == 0) else 0.
+    dy = (ymax - ymin) if (coord == 1) else 0.
+    dz = (zmax - zmin) if (coord == 2) else 0.
+    d = max(dx, dy, dz)
+    e *= d
+
+    smin = gmsh.model.getEntitiesInBoundingBox(
+        xmin      - e, ymin      - e, zmin      - e,
+        xmax - dx + e, ymax - dy + e, zmax - dz + e,
+        dim-1)
+    # print ("smin:",smin)
+    for i in smin:
+        bb = gmsh.model.getBoundingBox(*i)
+        bbe = [bb[0] + dx, bb[1] + dy, bb[2] + dz,
+               bb[3] + dx, bb[4] + dy, bb[5] + dz]
+        smax = gmsh.model.getEntitiesInBoundingBox(
+            bbe[0] - e, bbe[1] - e, bbe[2] - e,
+            bbe[3] + e, bbe[4] + e, bbe[5] + e,
+            dim-1)
+        # print ("smax:",smax)
+        for j in smax:
+            bb2 = gmsh.model.getBoundingBox(*j)
+            bb2e = [bb2[0] - dx, bb2[1] - dy, bb2[2] - dz,
+                    bb2[3] - dx, bb2[4] - dy, bb2[5] - dz]
+            if (numpy.linalg.norm(numpy.asarray(bb2e) - numpy.asarray(bb)) < e):
+                gmsh.model.mesh.setPeriodic(
+                    dim-1,
+                    [j[1]], [i[1]],
+                    [1, 0, 0, dx,\
+                     0, 1, 0, dy,\
+                     0, 0, 1, dz,\
+                     0, 0, 0, 1 ])
+
+################################################################################
+
+
+
+def extract_polygon_wall_edges_with_labels(coords, coords_in):
+    center = coords.mean(axis=0)
+    xc, yc = center
+
+    edges = []
+    n = len(coords)
+
+    for i in range(n):
+        p1_out = coords[i]
+        p2_out = coords[(i + 1) % n]
+
+        p1_in = coords_in[i]
+        p2_in = coords_in[(i + 1) % n]
+
+        xm_out = 0.5 * (p1_out[0] + p2_out[0])
+        ym_out = 0.5 * (p1_out[1] + p2_out[1])
+
+        xm_in = 0.5 * (p1_in[0] + p2_in[0])
+        ym_in = 0.5 * (p1_in[1] + p2_in[1])
+
+        xm_wall = 0.5 * (xm_out + xm_in)
+        ym_wall = 0.5 * (ym_out + ym_in)
+
+        theta = math.atan2(ym_out - yc, xm_out - xc)
+        side, side_id = classify_edge_direction(theta)
+
+        edges.append({
+            "local_edge_index": int(i),
+
+            "p1_out": [float(p1_out[0]), float(p1_out[1])],
+            "p2_out": [float(p2_out[0]), float(p2_out[1])],
+            "midpoint_out": [float(xm_out), float(ym_out)],
+
+            "p1_in": [float(p1_in[0]), float(p1_in[1])],
+            "p2_in": [float(p2_in[0]), float(p2_in[1])],
+            "midpoint_in": [float(xm_in), float(ym_in)],
+
+            "midpoint_wall": [float(xm_wall), float(ym_wall)],
+
+            "angle": float(theta),
+            "side": side,
+            "side_id": int(side_id),
+        })
+
+    return [float(xc), float(yc)], edges
+
+
+def point_in_regular_hex(px, py, cx, cy, R, angle0=np.pi / 2.0):
+    verts = []
+    for k in range(6):
+        th = angle0 + 2.0 * np.pi * k / 6.0
+        verts.append((cx + R * math.cos(th), cy + R * math.sin(th)))
+
+    inside = False
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        if (y1 > py) != (y2 > py):
+            xint = (x2 - x1) * (py - y1) / (y2 - y1 + 1e-16) + x1
+            if px < xint:
+                inside = not inside
+    return inside
+
+def find_surface_closest_to_point_in_center_hex(surface_tags, point, cx, cy, R, angle0):
+    x0, y0 = point
+    best_tag = None
+    best_dist = 1e30
+
+    for s in surface_tags:
+        xg, yg, zg = gmsh.model.occ.getCenterOfMass(2, s)
+        if not point_in_regular_hex(xg, yg, cx, cy, R, angle0):
+            continue
+        d = ((xg - x0)**2 + (yg - y0)**2) ** 0.5
+        if d < best_dist:
+            best_dist = d
+            best_tag = s
+
+    return best_tag, best_dist
+
+def add_hex_ring_surfaces(occ, cx, cy, Rin, Rout, angle0, lc):
+    inner_vertices = []
+    outer_vertices = []
+    for k in range(6):
+        th = angle0 + k * math.pi / 3.0
+        inner_vertices.append((cx + Rin * math.cos(th), cy + Rin * math.sin(th)))
+        outer_vertices.append((cx + Rout * math.cos(th), cy + Rout * math.sin(th)))
+
+    inner_pts = [occ.addPoint(float(x), float(y), 0.0, lc) for x, y in inner_vertices]
+    outer_pts = [occ.addPoint(float(x), float(y), 0.0, lc) for x, y in outer_vertices]
+
+    inner_lines = [occ.addLine(inner_pts[i], inner_pts[(i + 1) % 6]) for i in range(6)]
+    outer_lines = [occ.addLine(outer_pts[i], outer_pts[(i + 1) % 6]) for i in range(6)]
+
+    surfs = []
+    for i in range(6):
+        l1 = occ.addLine(inner_pts[i], outer_pts[i])
+        l2 = occ.addLine(inner_pts[(i + 1) % 6], outer_pts[(i + 1) % 6])
+        wire = occ.addWire([inner_lines[i], l2, outer_lines[i], l1])
+        s = occ.addPlaneSurface([wire])
+        surfs.append(s)
+
+    return surfs
+
+import gmsh
+import meshio
+import dolfin
+import numpy as np
+import math
+import pickle
+
+def add_regular_hex_surface(occ, cx, cy, R, angle0=0., lc=0.05):
+    pts = []
+    for k in range(6):
+        th = angle0 + k * math.pi / 3.0
+        pts.append(occ.addPoint(cx + R * math.cos(th), cy + R * math.sin(th), 0.0, lc))
+    lines = [occ.addLine(pts[i], pts[(i + 1) % 6]) for i in range(6)]
+    loop = occ.addCurveLoop(lines)
+    return occ.addPlaneSurface([loop])
+
+def add_rectangle_surface(occ, xmin, ymin, xmax, ymax):
+    return occ.addRectangle(xmin, ymin, 0.0, xmax - xmin, ymax - ymin)
+
+def inward_polygon(coords, offset_distance):
+    centroid = coords.mean(axis=0)
+    out = []
+    for p in coords:
+        dv = centroid - p
+        nrm = np.linalg.norm(dv)
+        if nrm == 0:
+            out.append(p.copy())
+        else:
+            out.append(p + offset_distance * dv / nrm)
+    return np.asarray(out)
+
+
+def build_patch_centers_from_specs(cell_metadata, cell_rc_map, patch_specs, offset):
+    """
+    patch_specs example:
+    [
+        {"row": 3, "col": 3, "side": "top_left", "kind": "inlet"},
+        {"row": 3, "col": 3, "side": "bottom_left", "kind": "outlet"},
+        {"row": 3, "col": 3, "side": "bottom_right", "kind": "outlet"},
+    ]
+    """
+    patch_data = []
+
+    for spec in patch_specs:
+        row = spec["row"]
+        col = spec["col"]
+        side = spec["side"]
+        kind = spec["kind"]
+
+        idx = cell_rc_map[(row, col)]
+        cell = cell_metadata[idx]
+
+        center, edge = compute_patch_center_from_cell_edge(cell, side, offset)
+
+        patch_data.append({
+            "row": row,
+            "col": col,
+            "cell_index": idx,
+            "cell_id": cell["cell_id"],
+            "side": side,
+            "kind": kind,
+            "edge_midpoint": edge["midpoint_wall"],
+            "patch_center": center,
+        })
+
+    return patch_data
+
+
+def compute_patch_center_from_cell_edge(cell, side, offset_along_wall=0.0):
+    """
+    Place the patch center inside the wall strip associated with one Voronoi edge.
+
+    Parameters
+    ----------
+    cell : dict
+    side : str or int
+    offset_along_wall : float
+        optional small shift along the edge tangent direction
+
+    Returns
+    -------
+    patch_center : tuple
+    edge : dict
+    """
+    edge = get_edge_by_side(cell, side)
+
+    xw, yw = edge["midpoint_wall"]
+
+    # tangent direction from outer edge
+    x1, y1 = edge["p1_out"]
+    x2, y2 = edge["p2_out"]
+
+    tx = x2 - x1
+    ty = y2 - y1
+    tn = (tx**2 + ty**2)**0.5
+
+    if tn < 1e-14:
+        raise RuntimeError(f"Degenerate edge for cell_id={cell['cell_id']}")
+
+    tx /= tn
+    ty /= tn
+
+    xc_patch = xw + offset_along_wall * tx
+    yc_patch = yw + offset_along_wall * ty
+
+    return (xc_patch, yc_patch), edge
+
+def side_to_ref_angle_deg(side):
+    directions = {
+        "right":         0.0,
+        "top_right":    60.0,
+        "top_left":    120.0,
+        "left":        180.0,
+        "bottom_left": -120.0,
+        "bottom_right": -60.0,
+    }
+    if side not in directions:
+        raise ValueError(f"Unknown side: {side}")
+    return directions[side]
+
+
+def get_edge_by_side(cell, side):
+    cx, cy = cell["center"]
+    ref_deg = side_to_ref_angle_deg(side)
+
+    best_edge = None
+    best_diff = 1e30
+
+    for e in cell["edges"]:
+        mx, my = e["midpoint_wall"]
+        theta = math.atan2(my - cy, mx - cx)
+        deg = math.degrees(theta)
+
+        while deg >= 180.0:
+            deg -= 360.0
+        while deg < -180.0:
+            deg += 360.0
+
+        diff = angle_diff_deg(deg, ref_deg)
+
+        if diff < best_diff:
+            best_diff = diff
+            best_edge = e
+
+    if best_edge is None:
+        raise RuntimeError(
+            f"No edge found for side={side} in cell_id={cell['cell_id']}"
+        )
+
+    return best_edge
+
+def add_hex_ring_surfaces(occ, cx, cy, Rin, Rout, angle0, lc):
+    inner_pts = []
+    outer_pts = []
+    for k in range(6):
+        th = angle0 + k * math.pi / 3.0
+        inner_pts.append(occ.addPoint(cx + Rin * math.cos(th), cy + Rin * math.sin(th), 0.0, lc))
+        outer_pts.append(occ.addPoint(cx + Rout * math.cos(th), cy + Rout * math.sin(th), 0.0, lc))
+    inner_lines = [occ.addLine(inner_pts[i], inner_pts[(i + 1) % 6]) for i in range(6)]
+    outer_lines = [occ.addLine(outer_pts[i], outer_pts[(i + 1) % 6]) for i in range(6)]
+    surfs = []
+    for i in range(6):
+        l1 = occ.addLine(inner_pts[i], outer_pts[i])
+        l2 = occ.addLine(inner_pts[(i + 1) % 6], outer_pts[(i + 1) % 6])
+        wire = occ.addWire([inner_lines[i], l2, outer_lines[i], l1])
+        surfs.append(occ.addPlaneSurface([wire]))
+    return surfs
+
+def build_raw_voronoi_wall_surfaces(occ, seeds, lc, offset_distance):
+    from scipy.spatial import Voronoi
+    vor = Voronoi(seeds)
+    all_voro_surfs = []
+    for region_index in vor.point_region:
+        region = vor.regions[region_index]
+        if not region or (-1 in region) or (len(region) < 3):
+            continue
+        coords = np.array([vor.vertices[v] for v in region], dtype=float)
+        coords_in = inward_polygon(coords, offset_distance)
+        n = len(coords)
+        out_pts = [occ.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in coords]
+        in_pts = [occ.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in coords_in]
+        out_lines = [occ.addLine(out_pts[i], out_pts[(i + 1) % n]) for i in range(n)]
+        in_lines = [occ.addLine(in_pts[i], in_pts[(i + 1) % n]) for i in range(n)]
+        for i in range(n):
+            l1 = occ.addLine(out_pts[i], in_pts[i])
+            l2 = occ.addLine(out_pts[(i + 1) % n], in_pts[(i + 1) % n])
+            wire = occ.addWire([out_lines[i], l2, in_lines[i], l1])
+            s = occ.addPlaneSurface([wire])
+            all_voro_surfs.append((2, s))
+    return all_voro_surfs
+
+def intersect_surfaces(occ, obj_dimtags, tool_dimtags):
+    out, _ = occ.intersect(
+        objectDimTags=obj_dimtags,
+        toolDimTags=tool_dimtags,
+        removeObject=True,
+        removeTool=False
+    )
+    occ.synchronize()
+    return [dt for dt in out if dt[0] == 2]
+
+def transform_points_local(base_pts, ref_cx, ref_cy, new_cx, new_cy, mirror_x=False, mirror_y=False):
+    pts = np.asarray(base_pts, dtype=float).copy()
+    pts[:, 0] -= ref_cx
+    pts[:, 1] -= ref_cy
+    if mirror_x:
+        pts[:, 0] *= -1.0
+    if mirror_y:
+        pts[:, 1] *= -1.0
+    pts[:, 0] += new_cx
+    pts[:, 1] += new_cy
+    return pts
+
+def build_voronoi_with_outer_ring_in_clip(
+    occ,
+    seeds,
+    cx,
+    cy,
+    rin,
+    rout,
+    angle0,
+    lc,
+    offset_distance,
+    clip_dimtags
+):
+    raw_voro = build_raw_voronoi_wall_surfaces(occ, seeds, lc, offset_distance)
+    occ.synchronize()
+
+    inner_hex = add_regular_hex_surface(occ, cx, cy, rin, angle0, lc)
+    occ.synchronize()
+
+    voro_in_hex = intersect_surfaces(
+        occ,
+        raw_voro,
+        [(2, inner_hex)]
+    )
+
+    voro_clipped = intersect_surfaces(
+        occ,
+        voro_in_hex,
+        clip_dimtags
+    )
+
+    ring_surfs = add_hex_ring_surfaces(occ, cx, cy, rin, rout, angle0, lc)
+    occ.synchronize()
+
+    ring_clipped = intersect_surfaces(
+        occ,
+        [(2, s) for s in ring_surfs],
+        clip_dimtags
+    )
+
+    return [tag for dim, tag in voro_clipped + ring_clipped if dim == 2]
+
+
+def classify_edge_direction(theta):
+    """
+    Classification for pointy-top hexagons / Voronoi-like cells.
+
+    Input
+    -----
+    theta : float
+        angle in radians from atan2(dy, dx)
+
+    Returns
+    -------
+    side_name : str
+        one of:
+        right, top_right, top_left, left, bottom_left, bottom_right
+    side_id : int
+        1 -> right
+        2 -> top_right
+        3 -> top_left
+        4 -> left
+        5 -> bottom_left
+        6 -> bottom_right
+    """
+    deg = math.degrees(theta)
+
+    while deg >= 180:
+        deg -= 360
+    while deg < -180:
+        deg += 360
+
+    directions = {
+        "right":        0.0,
+        "top_right":    60.0,
+        "top_left":    120.0,
+        "left":       180.0,
+        "bottom_left": -120.0,
+        "bottom_right": -60.0,
+    }
+
+    side_ids = {
+        "right": 1,
+        "top_right": 2,
+        "top_left": 3,
+        "left": 4,
+        "bottom_left": 5,
+        "bottom_right": 6,
+    }
+
+    best_label = None
+    best_diff = 1e30
+    for label, ref_deg in directions.items():
+        d = angle_diff_deg(deg, ref_deg)
+        if d < best_diff:
+            best_diff = d
+            best_label = label
+
+    return best_label, side_ids[best_label]
+
+
+def angle_diff_deg(a, b):
+    d = a - b
+    while d > 180:
+        d -= 360
+    while d < -180:
+        d += 360
+    return abs(d)
+
+
+def build_row_col_map_for_selected_cells(cell_metadata, selected_indices, y_tol=None):
+    """
+    Build (row, col) -> cell index using only selected cells.
+
+    Row numbering:
+        1 = top row
+    Col numbering:
+        left to right within each row
+    """
+    if len(selected_indices) == 0:
+        raise RuntimeError("No selected cells provided.")
+
+    centers = np.array([cell_metadata[idx]["center"] for idx in selected_indices], dtype=float)
+    y_vals = centers[:, 1]
+
+    if y_tol is None:
+        y_sorted = np.sort(y_vals)
+        if len(y_sorted) > 1:
+            dy = np.diff(y_sorted)
+            dy = dy[dy > 1e-12]
+            if len(dy) > 0:
+                y_tol = 0.5 * np.median(dy)
+            else:
+                y_tol = 1e-6
+        else:
+            y_tol = 1e-6
+
+    # sort selected cells by descending y
+    local_order = np.argsort(-y_vals)
+    rows = []
+    current_row = [local_order[0]]
+
+    for loc in local_order[1:]:
+        y_ref = y_vals[current_row[0]]
+        if abs(y_vals[loc] - y_ref) < y_tol:
+            current_row.append(loc)
+        else:
+            rows.append(current_row)
+            current_row = [loc]
+    rows.append(current_row)
+
+    cell_rc_map = {}
+    for i_row, row_local_ids in enumerate(rows, start=1):
+        row_local_ids = sorted(row_local_ids, key=lambda k: centers[k, 0])
+        for i_col, loc in enumerate(row_local_ids, start=1):
+            global_idx = selected_indices[loc]
+            cell_rc_map[(i_row, i_col)] = global_idx
+
+    return cell_rc_map
+
+
+def build_center_voronoi_with_metadata(
+    occ,
+    seeds,
+    cx,
+    cy,
+    rin,
+    rout,
+    angle0,
+    lc,
+    offset_distance,
+    clip_dimtags
+):
+    from scipy.spatial import Voronoi
+
+    vor = Voronoi(seeds)
+    raw_voro = []
+    cell_metadata = []
+
+    for i_seed, region_index in enumerate(vor.point_region):
+        region = vor.regions[region_index]
+        if not region or (-1 in region) or (len(region) < 3):
+            continue
+
+        coords = np.array([vor.vertices[v] for v in region], dtype=float)
+        coords_in = inward_polygon(coords, offset_distance)
+        n = len(coords)
+
+        center, edge_info = extract_polygon_wall_edges_with_labels(coords, coords_in)
+
+        cell_id = len(cell_metadata)
+        cell_metadata.append({
+            "cell_id": int(cell_id),
+            "seed_id": int(i_seed),
+            "seed": [float(seeds[i_seed, 0]), float(seeds[i_seed, 1])],
+            "center": center,
+            "vertices": [[float(x), float(y)] for x, y in coords],
+            "edges": edge_info,
+        })
+
+        out_pts = [occ.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in coords]
+        in_pts = [occ.addPoint(float(p[0]), float(p[1]), 0.0, lc) for p in coords_in]
+
+        out_lines = [occ.addLine(out_pts[i], out_pts[(i + 1) % n]) for i in range(n)]
+        in_lines = [occ.addLine(in_pts[i], in_pts[(i + 1) % n]) for i in range(n)]
+
+        for i in range(n):
+            l1 = occ.addLine(out_pts[i], in_pts[i])
+            l2 = occ.addLine(out_pts[(i + 1) % n], in_pts[(i + 1) % n])
+            wire = occ.addWire([out_lines[i], l2, in_lines[i], l1])
+            s = occ.addPlaneSurface([wire])
+            raw_voro.append((2, s))
+
+    occ.synchronize()
+
+    inner_hex = add_regular_hex_surface(occ, cx, cy, rin, angle0, lc)
+    occ.synchronize()
+
+    voro_in_hex = intersect_surfaces(
+        occ,
+        raw_voro,
+        [(2, inner_hex)]
+    )
+
+    voro_clipped = intersect_surfaces(
+        occ,
+        voro_in_hex,
+        clip_dimtags
+    )
+
+    ring_surfs = add_hex_ring_surfaces(occ, cx, cy, rin, rout, angle0, lc)
+    occ.synchronize()
+
+    ring_clipped = intersect_surfaces(
+        occ,
+        [(2, s) for s in ring_surfs],
+        clip_dimtags
+    )
+
+    kept_indices = []
+    for i, cell in enumerate(cell_metadata):
+        verts = np.array(cell["vertices"], dtype=float)
+        inside = True
+        for vx, vy in verts:
+            if not point_in_regular_hex(vx, vy, cx, cy, rin + 1e-9, angle0):
+                inside = False
+                break
+        if inside:
+            kept_indices.append(i)
+
+    center_cell_metadata = [cell_metadata[i] for i in kept_indices]
+    center_tags = [tag for dim, tag in voro_clipped + ring_clipped if dim == 2]
+
+    return center_tags, center_cell_metadata
+
+
+
+
+def find_surface_closest_to_point_filtered(surface_tags, point, angle0, center=None, radius=None):
+    x0, y0 = point
+    best_tag = None
+    best_dist = 1e30
+
+    for s in surface_tags:
+        xg, yg, zg = gmsh.model.occ.getCenterOfMass(2, s)
+
+        if center is not None and radius is not None:
+            if not point_in_regular_hex(xg, yg, center[0], center[1], radius, angle0):
+                continue
+
+        d = ((xg - x0) ** 2 + (yg - y0) ** 2) ** 0.5
+        if d < best_dist:
+            best_dist = d
+            best_tag = s
+
+    return best_tag, best_dist
+
+def rebuild_center_hex_structure(occ, center_tags):
+    center_dimtags = [(2, s) for s in center_tags]
+
+    frag_out, frag_map = occ.fragment(center_dimtags, [])
+    occ.synchronize()
+    occ.removeAllDuplicates()
+    occ.synchronize()
+
+    rebuilt_tags = []
+    for children in frag_map:
+        for dim, tag in children:
+            if dim == 2:
+                rebuilt_tags.append(tag)
+
+    return sorted(set(rebuilt_tags))
+
+
+def run_HollowBox_Mesh_Simple(params={}):
+    xmin = params.get("xmin", 0.0)
+    ymin = params.get("ymin", 0.0)
+    xmax = params.get("xmax", 1.0)
+    ymax = params.get("ymax", 1.0)
+
+    xshift = params.get("xshift", 0.0)
+    yshift = params.get("yshift", 0.0)
+
+    r_corner = params.get("r_corner", 0.55)
+    r_center = params.get("r_center", 0.55)
+
+    l = params.get("l", 0.05)
+    angle0 = params.get("angle0", np.pi / 2.0)
+
+    use_hex_aspect_ratio = params.get("use_hex_aspect_ratio", False)
+
+    use_center_voronoi = params.get("use_center_voronoi", True)
+    use_corner_voronoi = params.get("use_corner_voronoi", True)
+    use_periodic = params.get("use_periodic", True)
+
+    center_seeds_filename = params.get("center_seeds_filename", "seeds-2D-periodic.dat")
+    corner_seeds_filename = params.get("corner_seeds_filename", "seeds-2D-periodic.dat")
+
+    voronoi_offset = params.get("voronoi_offset", 0.01)
+    voronoi_lcar = params.get("voronoi_lcar", l)
+
+    patch_radius = params.get("patch_radius", 0.002)
+    patch_offset = params.get("patch_offset", 0.0)
+    center_row_tol = params.get("center_row_tol", None)
+
+    center_patch_specs = params.get(
+        "center_patch_specs",
+        [
+            {"row": 2, "col": 2, "side": "top_left", "kind": "inlet"},
+            {"row": 3, "col": 1, "side": "bottom_left", "kind": "outlet"},
+            {"row": 3, "col": 3, "side": "bottom_right", "kind": "outlet"},
+        ]
+    )
+
+    mesh_filebasename = params.get("mesh_filebasename", "mesh_simple")
+    show_gui = params.get("show_gui", False)
+
+    if use_hex_aspect_ratio:
+        width = xmax - xmin
+        ycenter_tmp = 0.5 * (ymin + ymax)
+        height = np.sqrt(3.0) * width
+        ymin = ycenter_tmp - 0.5 * height
+        ymax = ycenter_tmp + 0.5 * height
+
+    xmin_s = xmin + xshift
+    xmax_s = xmax + xshift
+    ymin_s = ymin + yshift
+    ymax_s = ymax + yshift
+
+    xcenter = 0.5 * (xmin_s + xmax_s)
+    ycenter = 0.5 * (ymin_s + ymax_s)
+
+    ul = (xmin_s, ymax_s)
+    ur = (xmax_s, ymax_s)
+    ll = (xmin_s, ymin_s)
+    lr = (xmax_s, ymin_s)
+
+    gmsh.initialize()
+    gmsh.model.add("HollowBoxSimple")
+    occ = gmsh.model.occ
+
+    box_tag = occ.addRectangle(xmin_s, ymin_s, 0.0, xmax_s - xmin_s, ymax_s - ymin_s)
+
+    hole_tags = []
+    for cx, cy in [ul, ur, ll, lr]:
+        hole_tags.append((2, add_regular_hex_surface(occ, cx, cy, r_corner + 2 * voronoi_offset, angle0, l)))
+
+    hole_tags.append((2, add_regular_hex_surface(occ, xcenter, ycenter, r_center + 2 * voronoi_offset, angle0, l)))
+
+    occ.synchronize()
+
+    outer_cut, _ = occ.cut(
+        objectDimTags=[(2, box_tag)],
+        toolDimTags=hole_tags,
+        removeObject=True,
+        removeTool=True
+    )
+    occ.synchronize()
+
+    outer_tags = [tag for dim, tag in outer_cut if dim == 2]
+
+    corner_tags = []
+    center_tags = []
+    center_cell_metadata = []
+    inlet_surfs = []
+    outlet_surfs = []
+
+    if use_center_voronoi:
+        with open(center_seeds_filename, "rb") as f:
+            center_seeds = pickle.load(f)
+        center_seeds = np.asarray(center_seeds)[:, :2]
+
+        center_clip_hex = add_regular_hex_surface(
+            occ,
+            xcenter,
+            ycenter,
+            r_center + 2 * voronoi_offset,
+            angle0,
+            voronoi_lcar
+        )
+        occ.synchronize()
+
+        center_tags, center_cell_metadata = build_center_voronoi_with_metadata(
+            occ=occ,
+            seeds=center_seeds,
+            cx=xcenter,
+            cy=ycenter,
+            rin=r_center,
+            rout=r_center + 2 * voronoi_offset,
+            angle0=angle0,
+            lc=voronoi_lcar,
+            offset_distance=voronoi_offset,
+            clip_dimtags=[(2, center_clip_hex)]
+        )
+
+    if use_corner_voronoi:
+        with open(corner_seeds_filename, "rb") as f:
+            corner_seeds_ul = pickle.load(f)
+        corner_seeds_ul = np.asarray(corner_seeds_ul)[:, :2]
+
+        clip_rect = add_rectangle_surface(occ, xmin_s, ymin_s, xmax_s, ymax_s)
+        occ.synchronize()
+
+        ul_outer_hex = add_regular_hex_surface(occ, ul[0], ul[1], r_corner + 2 * voronoi_offset, angle0, voronoi_lcar)
+        ur_outer_hex = add_regular_hex_surface(occ, ur[0], ur[1], r_corner + 2 * voronoi_offset, angle0, voronoi_lcar)
+        ll_outer_hex = add_regular_hex_surface(occ, ll[0], ll[1], r_corner + 2 * voronoi_offset, angle0, voronoi_lcar)
+        lr_outer_hex = add_regular_hex_surface(occ, lr[0], lr[1], r_corner + 2 * voronoi_offset, angle0, voronoi_lcar)
+        occ.synchronize()
+
+        ul_clip, _ = occ.intersect([(2, ul_outer_hex)], [(2, clip_rect)], removeObject=True, removeTool=False)
+        ur_clip, _ = occ.intersect([(2, ur_outer_hex)], [(2, clip_rect)], removeObject=True, removeTool=False)
+        ll_clip, _ = occ.intersect([(2, ll_outer_hex)], [(2, clip_rect)], removeObject=True, removeTool=False)
+        lr_clip, _ = occ.intersect([(2, lr_outer_hex)], [(2, clip_rect)], removeObject=True, removeTool=False)
+        occ.synchronize()
+
+        ul_clip = [dt for dt in ul_clip if dt[0] == 2]
+        ur_clip = [dt for dt in ur_clip if dt[0] == 2]
+        ll_clip = [dt for dt in ll_clip if dt[0] == 2]
+        lr_clip = [dt for dt in lr_clip if dt[0] == 2]
+
+        seeds_ur = transform_points_local(corner_seeds_ul, ul[0], ul[1], ur[0], ur[1], mirror_x=True, mirror_y=False)
+        seeds_ll = transform_points_local(corner_seeds_ul, ul[0], ul[1], ll[0], ll[1], mirror_x=False, mirror_y=True)
+        seeds_lr = transform_points_local(corner_seeds_ul, ul[0], ul[1], lr[0], lr[1], mirror_x=True, mirror_y=True)
+
+        tags_ul = build_voronoi_with_outer_ring_in_clip(
+            occ=occ,
+            seeds=corner_seeds_ul,
+            cx=ul[0],
+            cy=ul[1],
+            rin=r_corner,
+            rout=r_corner + 2 * voronoi_offset,
+            angle0=angle0,
+            lc=voronoi_lcar,
+            offset_distance=voronoi_offset,
+            clip_dimtags=ul_clip
+        )
+
+        tags_ur = build_voronoi_with_outer_ring_in_clip(
+            occ=occ,
+            seeds=seeds_ur,
+            cx=ur[0],
+            cy=ur[1],
+            rin=r_corner,
+            rout=r_corner + 2 * voronoi_offset,
+            angle0=angle0,
+            lc=voronoi_lcar,
+            offset_distance=voronoi_offset,
+            clip_dimtags=ur_clip
+        )
+
+        tags_ll = build_voronoi_with_outer_ring_in_clip(
+            occ=occ,
+            seeds=seeds_ll,
+            cx=ll[0],
+            cy=ll[1],
+            rin=r_corner,
+            rout=r_corner + 2 * voronoi_offset,
+            angle0=angle0,
+            lc=voronoi_lcar,
+            offset_distance=voronoi_offset,
+            clip_dimtags=ll_clip
+        )
+
+        tags_lr = build_voronoi_with_outer_ring_in_clip(
+            occ=occ,
+            seeds=seeds_lr,
+            cx=lr[0],
+            cy=lr[1],
+            rin=r_corner,
+            rout=r_corner + 2 * voronoi_offset,
+            angle0=angle0,
+            lc=voronoi_lcar,
+            offset_distance=voronoi_offset,
+            clip_dimtags=lr_clip
+        )
+
+        corner_tags = sorted(set(tags_ul + tags_ur + tags_ll + tags_lr))
+
+    occ.synchronize()
+
+    if use_center_voronoi and len(center_patch_specs) > 0 and len(center_cell_metadata) > 0:
+        center_tags = rebuild_center_hex_structure(
+            occ=occ,
+            center_tags=center_tags
+        )
+
+        selected_indices = list(range(len(center_cell_metadata)))
+
+        center_cell_rc_map = build_row_col_map_for_selected_cells(
+            center_cell_metadata,
+            selected_indices=selected_indices,
+            y_tol=0.1
+        )
+
+        center_patch_data = build_patch_centers_from_specs(
+            cell_metadata=center_cell_metadata,
+            cell_rc_map=center_cell_rc_map,
+            patch_specs=center_patch_specs,
+            offset=patch_offset
+        )
+
+        disk_entities = []
+        for p in center_patch_data:
+            x, y = p["patch_center"]
+            dtag = occ.addDisk(float(x), float(y), 0.0, patch_radius, patch_radius)
+            disk_entities.append((2, dtag))
+
+        occ.synchronize()
+
+        target_patch_surfs = [(2, s) for s in center_tags]
+        frag_out, frag_map = occ.fragment(target_patch_surfs, disk_entities)
+        occ.synchronize()
+        occ.removeAllDuplicates()
+        occ.synchronize()
+
+        new_center_tags = []
+        for children in frag_map[:len(target_patch_surfs)]:
+            for dim, tag in children:
+                if dim == 2:
+                    new_center_tags.append(tag)
+
+        center_tags = sorted(set(new_center_tags))
+
+        all_surfs_after_patch = [tag for dim, tag in gmsh.model.getEntities(2) if dim == 2]
+
+        for p in center_patch_data:
+            s_tag, dist = find_surface_closest_to_point_filtered(
+                all_surfs_after_patch,
+                p["patch_center"],
+                angle0=angle0,
+                center=(xcenter, ycenter),
+                radius=r_center + 2 * voronoi_offset
+            )
+
+            if s_tag is None:
+                raise RuntimeError(f"Could not identify center patch surface for {p}")
+
+            if p["kind"] == "inlet":
+                inlet_surfs.append(s_tag)
+            elif p["kind"] == "outlet":
+                outlet_surfs.append(s_tag)
+            else:
+                raise RuntimeError(f"Unknown patch kind: {p['kind']}")
+
+        patch_surfs_set = set(inlet_surfs + outlet_surfs)
+        center_tags = [s for s in center_tags if s not in patch_surfs_set]
+
+    inlet_surfs = sorted(set(inlet_surfs))
+    outlet_surfs = sorted(set(outlet_surfs))
+    center_tags = sorted(set(center_tags))
+    corner_tags = sorted(set(corner_tags))
+
+    if outer_tags:
+        pg_outer = gmsh.model.addPhysicalGroup(2, outer_tags)
+        gmsh.model.setPhysicalName(2, pg_outer, "barrier")
+
+    voro_tags = sorted(set(center_tags + corner_tags))
+    if voro_tags:
+        pg_voro = gmsh.model.addPhysicalGroup(2, voro_tags)
+        gmsh.model.setPhysicalName(2, pg_voro, "voronoi_wall")
+
+    if inlet_surfs:
+        pg_in = gmsh.model.addPhysicalGroup(2, inlet_surfs)
+        gmsh.model.setPhysicalName(2, pg_in, "inlet_region")
+
+    if outlet_surfs:
+        pg_out = gmsh.model.addPhysicalGroup(2, outlet_surfs)
+        gmsh.model.setPhysicalName(2, pg_out, "outlet_region")
+
+    occ.synchronize()
+
+    if use_periodic:
+        setPeriodic(
+            dim=2,
+            coord=0,
+            xmin=xmin_s,
+            ymin=ymin_s,
+            zmin=0.0,
+            xmax=xmax_s,
+            ymax=ymax_s,
+            zmax=0.0
+        )
+
+        setPeriodic(
+            dim=2,
+            coord=1,
+            xmin=xmin_s,
+            ymin=ymin_s,
+            zmin=0.0,
+            xmax=xmax_s,
+            ymax=ymax_s,
+            zmax=0.0
+        )
+
+    gmsh.model.mesh.setSize(gmsh.model.getEntities(0), l)
+    gmsh.model.mesh.generate(2)
+
+    if show_gui:
+        gmsh.fltk.run()
+
+    gmsh.write(mesh_filebasename + ".vtk")
+    gmsh.finalize()
+
+    mesh = meshio.read(mesh_filebasename + ".vtk")
+    mesh.points = mesh.points[:, :2]
+    meshio.write(mesh_filebasename + ".xdmf", mesh)
+
+    mesh = dolfin.Mesh()
+    dolfin.XDMFFile(mesh_filebasename + ".xdmf").read(mesh)
+
+    return mesh
+
+def find_surface_closest_to_point_filtered(surface_tags, point, angle0, center=None, radius=None):
+    x0, y0 = point
+    best_tag = None
+    best_dist = 1e30
+
+    for s in surface_tags:
+        xg, yg, zg = gmsh.model.occ.getCenterOfMass(2, s)
+
+        if center is not None and radius is not None:
+            if not point_in_regular_hex(xg, yg, center[0], center[1], radius, angle0):
+                continue
+
+        d = ((xg - x0) ** 2 + (yg - y0) ** 2) ** 0.5
+        if d < best_dist:
+            best_dist = d
+            best_tag = s
+
+    return best_tag, best_dist
+
+import time
+
+t0 = time.time()
+
+mesh = run_HollowBox_Mesh_Simple({
+    "xmin": 0.0,
+    "ymin": 0.0,
+    "xmax": 1.0,
+    "ymax": 1.0,
+    "r_corner": 0.55,
+    "r_center": 0.55,
+    "voronoi_offset": 0.01,
+    "l": 0.003,
+    "patch_radius": 0.003,
+    "patch_offset": 0.0,
+    "center_row_tol": 0.05,
+    "center_patch_specs": [
+        {"row": 2, "col": 1, "side": "top_left", "kind": "inlet"},
+        {"row": 5, "col": 1, "side": "bottom_left", "kind": "outlet"},
+        {"row": 5, "col": 2, "side": "bottom_right", "kind": "outlet"},
+    ],
+    "use_hex_aspect_ratio": True,
+    "mesh_filebasename": "hex_barrier_mesh"
+})
+
+t1 = time.time()
+print("Mesh generation time:", t1 - t0, "seconds")

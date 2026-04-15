@@ -19,10 +19,7 @@ import numpy
 import myPythonLibrary as mypy
 import dolfin_mech as dmech
 import os
-
-
 import numpy as np
-
 
 ## Function for Post-processing
 import json
