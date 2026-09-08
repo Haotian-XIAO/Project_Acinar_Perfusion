@@ -52,7 +52,15 @@ def setPeriodic(dim, coord, xmin, ymin, zmin, xmax, ymax, zmax, e=1e-6):
         xmin      - e, ymin      - e, zmin      - e,
         xmax - dx + e, ymax - dy + e, zmax - dz + e,
         dim-1)
-    # print ("smin:",smin)
+
+    if len(smin) == 0:
+        raise RuntimeError(
+            f"No master boundary curves found for periodic direction {coord}."
+        )
+
+    periodic_pairs = []
+    used_slave_tags = set()
+
     for i in smin:
         bb = gmsh.model.getBoundingBox(*i)
         bbe = [bb[0] + dx, bb[1] + dy, bb[2] + dz,
@@ -61,19 +69,40 @@ def setPeriodic(dim, coord, xmin, ymin, zmin, xmax, ymax, zmax, e=1e-6):
             bbe[0] - e, bbe[1] - e, bbe[2] - e,
             bbe[3] + e, bbe[4] + e, bbe[5] + e,
             dim-1)
-        # print ("smax:",smax)
+
+        matching_slaves = []
         for j in smax:
             bb2 = gmsh.model.getBoundingBox(*j)
             bb2e = [bb2[0] - dx, bb2[1] - dy, bb2[2] - dz,
                     bb2[3] - dx, bb2[4] - dy, bb2[5] - dz]
             if (numpy.linalg.norm(numpy.asarray(bb2e) - numpy.asarray(bb)) < e):
-                gmsh.model.mesh.setPeriodic(
-                    dim-1,
-                    [j[1]], [i[1]],
-                    [1, 0, 0, dx,\
-                     0, 1, 0, dy,\
-                     0, 0, 1, dz,\
-                     0, 0, 0, 1 ])
+                matching_slaves.append(j)
+
+        if len(matching_slaves) != 1:
+            raise RuntimeError(
+                "Periodic boundary curve matching failed: "
+                f"master curve {i[1]} in direction {coord} has "
+                f"{len(matching_slaves)} translated counterparts; expected exactly one."
+            )
+
+        j = matching_slaves[0]
+        if j[1] in used_slave_tags:
+            raise RuntimeError(
+                "Periodic boundary curve matching failed: "
+                f"slave curve {j[1]} is matched by more than one master curve."
+            )
+
+        used_slave_tags.add(j[1])
+        periodic_pairs.append((i, j))
+
+    for i, j in periodic_pairs:
+        gmsh.model.mesh.setPeriodic(
+            dim-1,
+            [j[1]], [i[1]],
+            [1, 0, 0, dx,\
+             0, 1, 0, dy,\
+             0, 0, 1, dz,\
+             0, 0, 0, 1 ])
 
 ################################################################################
 
@@ -422,6 +451,124 @@ def build_raw_voronoi_wall_surfaces(occ, seeds, lc, offset_distance):
             all_voro_surfs.append((2, s))
     return all_voro_surfs
 
+
+def generate_rectangular_base_seeds(
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    grid_x,
+    grid_y,
+    irregularity=0.0,
+    rng_seed=None,
+):
+    """Generate one deterministic seed population in a half-open unit cell."""
+    if grid_x < 2 or grid_y < 2:
+        raise ValueError("grid_x and grid_y must both be at least 2.")
+    if not 0.0 <= irregularity < 1.0:
+        raise ValueError("irregularity must satisfy 0 <= irregularity < 1.")
+
+    width = xmax - xmin
+    height = ymax - ymin
+    if width <= 0.0 or height <= 0.0:
+        raise ValueError("The periodic unit cell must have positive width and height.")
+
+    dx = width / grid_x
+    dy = height / grid_y
+    rng = np.random.default_rng(rng_seed)
+    seeds = []
+
+    for j in range(grid_y):
+        row_shift = 0.5 * dx if (j % 2) else 0.0
+        for i in range(grid_x):
+            x = xmin + (i + 0.5) * dx + row_shift
+            y = ymin + (j + 0.5) * dy
+
+            x += (rng.random() - 0.5) * irregularity * dx
+            y += (rng.random() - 0.5) * irregularity * dy
+
+            # Wrapping preserves one canonical seed population in the
+            # half-open cell even for the shifted final seed in odd rows.
+            x = xmin + ((x - xmin) % width)
+            y = ymin + ((y - ymin) % height)
+            seeds.append((x, y))
+
+    return np.asarray(seeds, dtype=float)
+
+
+def make_periodic_seed_cloud(base_seeds, a1, a2):
+    """Return the central seeds and their eight nearest lattice copies."""
+    base_seeds = np.asarray(base_seeds, dtype=float)
+    a1 = np.asarray(a1, dtype=float)
+    a2 = np.asarray(a2, dtype=float)
+
+    if base_seeds.ndim != 2 or base_seeds.shape[1] < 2:
+        raise ValueError("base_seeds must have shape (n, 2) or (n, 3).")
+    base_seeds = base_seeds[:, :2]
+    if len(base_seeds) < 4:
+        raise ValueError("At least four base seeds are required.")
+    if a1.shape != (2,) or a2.shape != (2,):
+        raise ValueError("a1 and a2 must be two-dimensional lattice vectors.")
+    if abs(np.linalg.det(np.column_stack((a1, a2)))) < 1e-14:
+        raise ValueError("a1 and a2 must be linearly independent.")
+
+    seed_sets = []
+    for i in (-1, 0, 1):
+        for j in (-1, 0, 1):
+            seed_sets.append(base_seeds + i * a1 + j * a2)
+
+    return np.vstack(seed_sets)
+
+
+def build_periodic_voronoi_walls_in_rectangle(
+    occ,
+    base_seeds,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    lc,
+    offset_distance,
+):
+    """Build the extended thick-wall tessellation, then clip the central cell."""
+    a1 = np.array([xmax - xmin, 0.0], dtype=float)
+    a2 = np.array([0.0, ymax - ymin], dtype=float)
+    periodic_seeds = make_periodic_seed_cloud(base_seeds, a1, a2)
+
+    raw_walls = build_raw_voronoi_wall_surfaces(
+        occ=occ,
+        seeds=periodic_seeds,
+        lc=lc,
+        offset_distance=offset_distance,
+    )
+    occ.synchronize()
+
+    clip_surface = add_rectangle_surface(occ, xmin, ymin, xmax, ymax)
+    occ.synchronize()
+
+    clipped, _ = occ.intersect(
+        objectDimTags=raw_walls,
+        toolDimTags=[(2, clip_surface)],
+        removeObject=True,
+        removeTool=True,
+    )
+    occ.synchronize()
+
+    clipped = [dimtag for dimtag in clipped if dimtag[0] == 2]
+    if len(clipped) == 0:
+        raise RuntimeError("Periodic Voronoi clipping produced no wall surfaces.")
+
+    occ.fragment(clipped, [])
+    occ.synchronize()
+    occ.removeAllDuplicates()
+    occ.synchronize()
+
+    wall_tags = [tag for dim, tag in gmsh.model.getEntities(2) if dim == 2]
+    if len(wall_tags) == 0:
+        raise RuntimeError("Periodic Voronoi construction produced no final surfaces.")
+
+    return sorted(set(wall_tags)), periodic_seeds
+
 def intersect_surfaces(occ, obj_dimtags, tool_dimtags):
     out, _ = occ.intersect(
         objectDimTags=obj_dimtags,
@@ -735,6 +882,127 @@ def rebuild_center_hex_structure(occ, center_tags):
                 rebuilt_tags.append(tag)
 
     return sorted(set(rebuilt_tags))
+
+
+def run_PeriodicVoronoi_Mesh(params=None):
+    """Generate a strictly periodic rectangular Voronoi thick-wall patch."""
+    if params is None:
+        params = {}
+
+    xmin = float(params.get("xmin", 0.0))
+    ymin = float(params.get("ymin", 0.0))
+    xmax = float(params.get("xmax", 1.0))
+    ymax = float(params.get("ymax", 1.0))
+    lc = float(params.get("l", 0.01))
+    offset_distance = float(params.get("voronoi_offset", 0.01))
+    mesh_filebasename = params.get(
+        "mesh_filebasename",
+        "mesh/Mesh_Acinar_Perfusion_Periodic",
+    )
+    show_gui = bool(params.get("show_gui", False))
+
+    if offset_distance <= 0.0:
+        raise ValueError("voronoi_offset must be positive.")
+    if lc <= 0.0:
+        raise ValueError("l must be positive.")
+
+    base_seeds = params.get("base_seeds")
+    if base_seeds is None:
+        base_seeds = generate_rectangular_base_seeds(
+            xmin=xmin,
+            ymin=ymin,
+            xmax=xmax,
+            ymax=ymax,
+            grid_x=int(params.get("grid_x", 12)),
+            grid_y=int(params.get("grid_y", 12)),
+            irregularity=float(params.get("DoI", 0.3)),
+            rng_seed=params.get("rng_seed", 1),
+        )
+    else:
+        base_seeds = np.asarray(base_seeds, dtype=float)
+
+    if base_seeds.ndim != 2 or base_seeds.shape[1] < 2:
+        raise ValueError("base_seeds must have shape (n, 2) or (n, 3).")
+    base_seeds = base_seeds[:, :2]
+
+    tol = 1e-12 * max(xmax - xmin, ymax - ymin)
+    inside = (
+        (base_seeds[:, 0] >= xmin - tol)
+        & (base_seeds[:, 0] < xmax - tol)
+        & (base_seeds[:, 1] >= ymin - tol)
+        & (base_seeds[:, 1] < ymax - tol)
+    )
+    if not np.all(inside):
+        bad_ids = np.where(~inside)[0].tolist()
+        raise ValueError(
+            "Every base seed must belong to the half-open central unit cell; "
+            f"invalid seed indices: {bad_ids}."
+        )
+
+    gmsh.initialize()
+    try:
+        gmsh.model.add("PeriodicVoronoiPatch")
+        occ = gmsh.model.occ
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+
+        wall_tags, periodic_seeds = build_periodic_voronoi_walls_in_rectangle(
+            occ=occ,
+            base_seeds=base_seeds,
+            xmin=xmin,
+            ymin=ymin,
+            xmax=xmax,
+            ymax=ymax,
+            lc=lc,
+            offset_distance=offset_distance,
+        )
+
+        wall_group = gmsh.model.addPhysicalGroup(2, wall_tags, tag=2)
+        gmsh.model.setPhysicalName(2, wall_group, "voronoi_wall")
+        occ.synchronize()
+
+        # The geometry is complete before the accepted Gmsh periodic meshing
+        # mechanism is invoked.
+        setPeriodic(
+            dim=2,
+            coord=0,
+            xmin=xmin,
+            ymin=ymin,
+            zmin=0.0,
+            xmax=xmax,
+            ymax=ymax,
+            zmax=0.0,
+        )
+        setPeriodic(
+            dim=2,
+            coord=1,
+            xmin=xmin,
+            ymin=ymin,
+            zmin=0.0,
+            xmax=xmax,
+            ymax=ymax,
+            zmax=0.0,
+        )
+
+        gmsh.model.mesh.setSize(gmsh.model.getEntities(0), lc)
+        gmsh.model.mesh.generate(2)
+
+        if show_gui:
+            gmsh.fltk.run()
+
+        gmsh.write(mesh_filebasename + ".msh")
+    finally:
+        gmsh.finalize()
+
+    convert_msh_to_xdmf_with_domains(mesh_filebasename, dim=2)
+    print(f"[DONE] Periodic mesh saved as {mesh_filebasename}.msh/.xdmf/_domains.xdmf")
+
+    return {
+        "base_seed_count": int(len(base_seeds)),
+        "periodic_seed_count": int(len(periodic_seeds)),
+        "a1": np.array([xmax - xmin, 0.0], dtype=float),
+        "a2": np.array([0.0, ymax - ymin], dtype=float),
+        "wall_surface_count": int(len(wall_tags)),
+    }
 
 
 def run_HollowBox_Mesh_Simple(params={}):
@@ -1085,39 +1353,24 @@ def find_surface_closest_to_point_filtered(surface_tags, point, angle0, center=N
 
     return best_tag, best_dist
 
-import time
+if __name__ == "__main__":
+    import time
 
-t0 = time.time()
+    t0 = time.time()
 
-mesh = run_HollowBox_Mesh_Simple({
-    "xmin": 0.0,
-    "ymin": 0.0,
-    "xmax": 1.0,
-    "ymax": 1.0,
-    "r_corner": 0.52,
-    "r_center": 0.52,
-    "voronoi_offset": 0.013,
-    #"voronoi_offset": 0.0075,
-    "l": 0.01,
-    "patch_radius": 0.003,
-    "patch_offset": 0.0,
-    "center_row_tol": 0.05,
-    "use_periodic": True,
-    "use_corner_voronoi": False,
+    run_PeriodicVoronoi_Mesh({
+        "xmin": 0.0,
+        "ymin": 0.0,
+        "xmax": 1.0,
+        "ymax": 1.0,
+        "grid_x": 12,
+        "grid_y": 12,
+        "DoI": 0.3,
+        "rng_seed": 1,
+        "voronoi_offset": 0.013,
+        "l": 0.01,
+        "mesh_filebasename": "mesh/Mesh_Acinar_Perfusion_Periodic",
+    })
 
-    "center_patch_specs": [
-        {"row": 2, "col": 1, "side": "top_left", "kind": "inlet"},
-        {"row": 5, "col": 1, "side": "bottom_left", "kind": "outlet"},
-        {"row": 3, "col": 1, "side": "bottom_right", "kind": "outlet"},
-    ],
-
-    "center_seeds_filename": "mesh/Mesh_Acinar_Perfusion_HexCenter_seeds_base.pkl",
-    "corner_seeds_filename": "mesh/Mesh_Acinar_Perfusion_HexCenter_seeds_base.pkl",
-
-    "use_hex_aspect_ratio": True,
-    "mesh_filebasename": "mesh/Mesh_Acinar_Perfusion_HexCenter"
-})
-
-t1 = time.time()
-print("Mesh generation time:", t1 - t0, "seconds")
-
+    t1 = time.time()
+    print("Mesh generation time:", t1 - t0, "seconds")
