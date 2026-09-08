@@ -614,7 +614,8 @@ def build_center_voronoi_with_metadata(
     angle0,
     lc,
     offset_distance,
-    clip_dimtags
+    clip_dimtags,
+    active_seed_count=None
 ):
     from scipy.spatial import Voronoi
 
@@ -622,8 +623,15 @@ def build_center_voronoi_with_metadata(
     raw_voro = []
     cell_metadata = []
 
+    if active_seed_count is None:
+        active_seed_count = len(seeds)
+
     for i_seed, region_index in enumerate(vor.point_region):
+        if i_seed >= active_seed_count:
+            continue
+
         region = vor.regions[region_index]
+
         if not region or (-1 in region) or (len(region) < 3):
             continue
 
@@ -683,13 +691,16 @@ def build_center_voronoi_with_metadata(
     )
 
     kept_indices = []
+
     for i, cell in enumerate(cell_metadata):
         verts = np.array(cell["vertices"], dtype=float)
         inside = True
+
         for vx, vy in verts:
             if not point_in_regular_hex(vx, vy, cx, cy, rin + 1e-9, angle0):
                 inside = False
                 break
+
         if inside:
             kept_indices.append(i)
 
@@ -697,7 +708,6 @@ def build_center_voronoi_with_metadata(
     center_tags = [tag for dim, tag in voro_clipped + ring_clipped if dim == 2]
 
     return center_tags, center_cell_metadata
-
 
 
 
@@ -1103,7 +1113,7 @@ mesh = run_HollowBox_Mesh_Simple({
     "patch_offset": 0.0,
     "center_row_tol": 0.05,
     "use_periodic": True,
-    "use_corner_voronoi": False,
+    "use_corner_voronoi": True,
 
     "center_patch_specs": [
         {"row": 2, "col": 1, "side": "top_left", "kind": "inlet"},
