@@ -23,6 +23,7 @@ import gmsh
 import meshio
 import numpy
 import math
+import json
 
 import dolfin_mech as dmech
 
@@ -569,6 +570,146 @@ def build_periodic_voronoi_walls_in_rectangle(
 
     return sorted(set(wall_tags)), periodic_seeds
 
+
+def load_vascular_patch_sites(metadata_json, number_of_venous_sinks=2):
+    """Load canonical arterial and selected venous patch sites from metadata."""
+    with open(metadata_json, "r") as stream:
+        metadata = json.load(stream)
+
+    arterial = metadata.get("arterial_sources", [])
+    if len(arterial) != 4:
+        raise ValueError("Vascular metadata must contain Pa0--Pa3 arterial sources.")
+
+    solutions = metadata.get("fixed_number_solutions", [])
+    solution = next(
+        (item for item in solutions
+         if int(item["number_of_venous_sinks"]) == int(number_of_venous_sinks)),
+        None,
+    )
+    if solution is None:
+        raise ValueError(
+            f"No fixed-Nv={number_of_venous_sinks} solution in vascular metadata."
+        )
+
+    sites = []
+    for item in sorted(arterial, key=lambda value: value["arterial_id"]):
+        sites.append({
+            "vascular_id": str(item["arterial_id"]),
+            "vascular_type": "arterial",
+            "coordinate": [float(v) for v in item["arterial_coordinate"]],
+            "terminal_id": int(item["terminal_id"]),
+            "acinus_id": int(item["acinus_id"]),
+            "terminal_coordinate": [float(v) for v in item["terminal_coordinate"]],
+        })
+    for item in sorted(solution["selected_sinks"], key=lambda value: value["candidate_id"]):
+        sites.append({
+            "vascular_id": str(item["candidate_id"]),
+            "vascular_type": "venous",
+            "coordinate": [float(v) for v in item["coordinate"]],
+            "adjacent_acini": [int(v) for v in item["adjacent_acini"]],
+            "candidate_type": str(item["candidate_type"]),
+        })
+
+    expected = {"Pa0", "Pa1", "Pa2", "Pa3", "V002", "V006"}
+    found = {item["vascular_id"] for item in sites}
+    if found != expected:
+        raise ValueError(f"Expected vascular IDs {sorted(expected)}, found {sorted(found)}.")
+    return sites
+
+
+def _periodic_patch_centers(point, radius, xmin, ymin, xmax, ymax):
+    """Return translated copies whose disks can intersect the canonical cell."""
+    point = np.asarray(point, dtype=float)
+    centers = []
+    for i in (-1, 0, 1):
+        for j in (-1, 0, 1):
+            center = point + np.array([i * (xmax - xmin), j * (ymax - ymin)])
+            if (center[0] + radius >= xmin and center[0] - radius <= xmax and
+                    center[1] + radius >= ymin and center[1] - radius <= ymax):
+                centers.append(center)
+    return centers
+
+
+def fragment_wall_with_vascular_patches(
+    occ,
+    wall_tags,
+    sites,
+    patch_radius,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+):
+    """Subdivide existing wall surfaces and return per-site surface tags.
+
+    Only descendants of the original wall surfaces are retained.  Disk-only
+    Boolean fragments are removed, preventing a patch from adding geometry in
+    an alveolar void or outside the canonical wall domain.
+    """
+    if patch_radius <= 0.0:
+        raise ValueError("patch_radius must be positive.")
+
+    wall_inputs = [(2, int(tag)) for tag in sorted(set(wall_tags))]
+    disk_inputs = []
+    for site in sites:
+        for center in _periodic_patch_centers(
+            site["coordinate"], patch_radius, xmin, ymin, xmax, ymax
+        ):
+            disk_tag = occ.addDisk(
+                float(center[0]), float(center[1]), 0.0,
+                float(patch_radius), float(patch_radius),
+            )
+            disk_inputs.append((2, disk_tag))
+    occ.synchronize()
+
+    _, fragment_map = occ.fragment(wall_inputs, disk_inputs)
+    occ.synchronize()
+
+    wall_descendants = set()
+    for mapped in fragment_map[:len(wall_inputs)]:
+        wall_descendants.update(
+            int(tag) for dim, tag in mapped if int(dim) == 2
+        )
+
+    all_surface_tags = {int(tag) for dim, tag in occ.getEntities(2)}
+    foreign_tags = sorted(all_surface_tags - wall_descendants)
+    if foreign_tags:
+        occ.remove([(2, tag) for tag in foreign_tags], recursive=True)
+        occ.synchronize()
+
+    retained = {int(tag) for dim, tag in occ.getEntities(2)}
+    wall_descendants &= retained
+    if not wall_descendants:
+        raise RuntimeError("Vascular patch fragmentation removed all wall surfaces.")
+
+    patch_tags = {site["vascular_id"]: [] for site in sites}
+    tol = max(1e-10, 1e-6 * patch_radius)
+    for tag in sorted(wall_descendants):
+        center = np.asarray(occ.getCenterOfMass(2, tag)[:2], dtype=float)
+        matches = []
+        for site in sites:
+            for image_center in _periodic_patch_centers(
+                site["coordinate"], patch_radius, xmin, ymin, xmax, ymax
+            ):
+                if np.linalg.norm(center - image_center) <= patch_radius + tol:
+                    matches.append(site["vascular_id"])
+                    break
+        matches = sorted(set(matches))
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Vascular patch overlap detected for surface {tag}: {matches}."
+            )
+        if len(matches) == 1:
+            patch_tags[matches[0]].append(tag)
+
+    for vascular_id, tags in patch_tags.items():
+        if not tags:
+            raise RuntimeError(
+                f"Vascular patch {vascular_id} produced no wall surface fragments."
+            )
+
+    return sorted(wall_descendants), patch_tags
+
 def intersect_surfaces(occ, obj_dimtags, tool_dimtags):
     out, _ = occ.intersect(
         objectDimTags=obj_dimtags,
@@ -900,6 +1041,10 @@ def run_PeriodicVoronoi_Mesh(params=None):
         "mesh/Mesh_Acinar_Perfusion_Periodic",
     )
     show_gui = bool(params.get("show_gui", False))
+    gmsh_verbose = bool(params.get("gmsh_verbose", True))
+    vascular_metadata_json = params.get("vascular_metadata_json")
+    vascular_patch_radius = float(params.get("patch_radius", 0.003))
+    vascular_number_of_venous_sinks = int(params.get("number_of_venous_sinks", 2))
 
     if offset_distance <= 0.0:
         raise ValueError("voronoi_offset must be positive.")
@@ -943,6 +1088,7 @@ def run_PeriodicVoronoi_Mesh(params=None):
     try:
         gmsh.model.add("PeriodicVoronoiPatch")
         occ = gmsh.model.occ
+        gmsh.option.setNumber("General.Terminal", 1 if gmsh_verbose else 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
 
         wall_tags, periodic_seeds = build_periodic_voronoi_walls_in_rectangle(
@@ -956,8 +1102,51 @@ def run_PeriodicVoronoi_Mesh(params=None):
             offset_distance=offset_distance,
         )
 
-        wall_group = gmsh.model.addPhysicalGroup(2, wall_tags, tag=2)
+        vascular_sites = None
+        vascular_patch_tags = {}
+        if vascular_metadata_json is not None:
+            vascular_sites = load_vascular_patch_sites(
+                vascular_metadata_json,
+                number_of_venous_sinks=vascular_number_of_venous_sinks,
+            )
+            wall_tags, vascular_patch_tags = fragment_wall_with_vascular_patches(
+                occ=occ,
+                wall_tags=wall_tags,
+                sites=vascular_sites,
+                patch_radius=vascular_patch_radius,
+                xmin=xmin,
+                ymin=ymin,
+                xmax=xmax,
+                ymax=ymax,
+            )
+
+        ordinary_wall_tags = list(wall_tags)
+        if vascular_sites is not None:
+            patch_union = {
+                int(tag) for tags in vascular_patch_tags.values() for tag in tags
+            }
+            ordinary_wall_tags = [tag for tag in wall_tags if int(tag) not in patch_union]
+        wall_group = gmsh.model.addPhysicalGroup(2, ordinary_wall_tags, tag=2)
         gmsh.model.setPhysicalName(2, wall_group, "voronoi_wall")
+        marker_mapping = {}
+        if vascular_sites is not None:
+            next_tag = 3
+            site_by_id = {item["vascular_id"]: item for item in vascular_sites}
+            for vascular_id in sorted(vascular_patch_tags):
+                physical_tag = next_tag
+                next_tag += 1
+                gmsh.model.addPhysicalGroup(
+                    2, sorted(set(vascular_patch_tags[vascular_id])), tag=physical_tag
+                )
+                gmsh.model.setPhysicalName(2, physical_tag, vascular_id)
+                marker_mapping[vascular_id] = {
+                    "physical_tag": physical_tag,
+                    "vascular_type": site_by_id[vascular_id]["vascular_type"],
+                    "coordinate": site_by_id[vascular_id]["coordinate"],
+                    "terminal_id": site_by_id[vascular_id].get("terminal_id"),
+                    "acinus_id": site_by_id[vascular_id].get("acinus_id"),
+                    "candidate_type": site_by_id[vascular_id].get("candidate_type"),
+                }
         occ.synchronize()
 
         # The geometry is complete before the accepted Gmsh periodic meshing
@@ -994,6 +1183,14 @@ def run_PeriodicVoronoi_Mesh(params=None):
         gmsh.finalize()
 
     convert_msh_to_xdmf_with_domains(mesh_filebasename, dim=2)
+    if vascular_sites is not None:
+        with open(mesh_filebasename + "_vascular_markers.json", "w") as stream:
+            json.dump({
+                "metadata_json": str(vascular_metadata_json),
+                "patch_radius": vascular_patch_radius,
+                "number_of_venous_sinks": vascular_number_of_venous_sinks,
+                "markers": marker_mapping,
+            }, stream, indent=2)
     print(f"[DONE] Periodic mesh saved as {mesh_filebasename}.msh/.xdmf/_domains.xdmf")
 
     return {
@@ -1002,6 +1199,7 @@ def run_PeriodicVoronoi_Mesh(params=None):
         "a1": np.array([xmax - xmin, 0.0], dtype=float),
         "a2": np.array([0.0, ymax - ymin], dtype=float),
         "wall_surface_count": int(len(wall_tags)),
+        "vascular_markers": marker_mapping,
     }
 
 
