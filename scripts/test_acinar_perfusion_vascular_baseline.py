@@ -21,6 +21,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 MESH_BASE = ROOT / "mesh" / "Mesh_Acinar_Perfusion_VascularMarkers"
 MARKER_JSON = Path(str(MESH_BASE) + "_vascular_markers.json")
+ACINAR_METADATA_JSON = ROOT / "results" / "acinar_partition" / "periodic_acinar_metadata.json"
 RESULTS = ROOT / "results" / "vascular_baseline"
 RESULT_BASE = RESULTS / "vascular_baseline"
 
@@ -60,6 +61,13 @@ SOLVER_PARAMETERS = {
     "linear_solver_name": "umfpack",
     "relax_type": "constant",
 }
+MACROSCOPIC_DISPLACEMENT_GRADIENT = ((0.0, 0.0), (0.0, 0.0))
+GAS_PRESSURE_MODE = "global"
+GLOBAL_GAS_PRESSURE = 0.0
+REGIONAL_GAS_PRESSURES = (0.0, 0.0, 0.0, 0.0)
+REGIONAL_GAS_TAGS = {0: 10, 1: 11, 2: 12, 3: 13}
+GAS_FACET_TIE_TOLERANCE = 1e-12
+USE_REGIONAL_GAS_BOUNDARY_MEASURE_FOR_GLOBAL = False
 
 
 class VascularSourceOnlyOperator(dmech.Operator):
@@ -75,6 +83,35 @@ class VascularSourceOnlyOperator(dmech.Operator):
 
     def set_value_at_t_step(self, t_step):
         self.tv_theta.set_value_at_t_step(t_step)
+
+
+class OperatorSumAdapter(dmech.Operator):
+    """Expose a sum of existing operators as one project-level operator."""
+
+    def __init__(self, operators):
+        if not operators:
+            raise ValueError("OperatorSumAdapter requires at least one operator.")
+        self.operators = list(operators)
+        self.measure = self.operators[0].measure
+        self.res_form = sum(operator.res_form for operator in self.operators)
+
+    def set_value_at_t_step(self, t_step):
+        for operator in self.operators:
+            operator.set_value_at_t_step(t_step)
+
+
+class UnionDeformedSurfaceAreaOperator(dmech.Operator):
+    """Original surface-area equation integrated over a tagged gas-facet union."""
+
+    def __init__(self, S_area, S_area_test, kinematics, N, measures):
+        self.measure = measures[0]
+        FmTN = dolfin.dot(dolfin.inv(kinematics.F).T, N)
+        stretch = dolfin.sqrt(dolfin.inner(FmTN, FmTN))
+        S0 = sum(float(dolfin.assemble(dolfin.Constant(1.0) * measure)) for measure in measures)
+        self.res_form = sum(
+            ((S_area / S0 - stretch * kinematics.J) * S_area_test) * measure
+            for measure in measures
+        )
 
 
 def load_mesh_and_markers():
@@ -123,6 +160,110 @@ def make_boundary_markers(mesh):
     points.set_all(0)
     vertices = np.array([[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]])
     return boundaries, points, vertices, [xmin, xmax, ymin, ymax]
+
+
+def make_regional_gas_boundary_markers(mesh, original_boundaries):
+    """Assign every original gas facet to one periodic canonical acinus.
+
+    The returned marker is deliberately separate from ``original_boundaries``:
+    the latter remains authoritative for the periodic cuts (tags 1--4), the
+    global gas boundary (tag 0), and existing global surface diagnostics.
+    """
+    if not ACINAR_METADATA_JSON.exists():
+        raise FileNotFoundError(f"Missing accepted acinar metadata: {ACINAR_METADATA_JSON}")
+    metadata = json.loads(ACINAR_METADATA_JSON.read_text())
+    cells = sorted(metadata["cells"], key=lambda item: int(item["cell_id"]))
+    seeds = np.asarray([item["seed_coordinate"] for item in cells], dtype=float)
+    acinus_ids = np.asarray([int(item["acinus_id"]) for item in cells], dtype=int)
+    lattice = np.column_stack([
+        np.asarray(metadata["periodic_cell"]["a1"], dtype=float),
+        np.asarray(metadata["periodic_cell"]["a2"], dtype=float),
+    ])
+    lattice_inverse = np.linalg.inv(lattice)
+    if set(acinus_ids.tolist()) != set(REGIONAL_GAS_TAGS):
+        raise RuntimeError(f"Expected acini {sorted(REGIONAL_GAS_TAGS)}, found {sorted(set(acinus_ids))}.")
+
+    regional = dolfin.MeshFunction("size_t", mesh, mesh.topology().dim() - 1)
+    regional.array()[:] = original_boundaries.array()
+    mesh.init(mesh.topology().dim() - 1, mesh.topology().dim())
+    counts = {f"A{acinus_id}": 0 for acinus_id in sorted(REGIONAL_GAS_TAGS)}
+    assignments = set()
+    original_gas_facets = set()
+    ties = []
+    outer_contamination = []
+    for facet in dolfin.facets(mesh):
+        if not facet.exterior():
+            continue
+        facet_index = int(facet.index())
+        original_tag = int(original_boundaries[facet])
+        if original_tag == 0:
+            original_gas_facets.add(facet_index)
+            midpoint = np.asarray(facet.midpoint().array()[:2], dtype=float)
+            fractional = (lattice_inverse @ (midpoint[None, :] - seeds).T).T
+            fractional -= np.round(fractional)
+            displacement = (lattice @ fractional.T).T
+            squared_distance = np.einsum("ij,ij->i", displacement, displacement)
+            order = np.argsort(squared_distance, kind="stable")
+            gap = float(squared_distance[order[1]] - squared_distance[order[0]])
+            if gap <= GAS_FACET_TIE_TOLERANCE:
+                ties.append({"facet_index": facet_index, "squared_distance_gap": gap})
+                continue
+            acinus_id = int(acinus_ids[order[0]])
+            if facet_index in assignments:
+                raise RuntimeError(f"Gas facet {facet_index} was assigned more than once.")
+            regional[facet] = REGIONAL_GAS_TAGS[acinus_id]
+            assignments.add(facet_index)
+            counts[f"A{acinus_id}"] += 1
+        elif original_tag in (1, 2, 3, 4):
+            if int(regional[facet]) in REGIONAL_GAS_TAGS.values():
+                outer_contamination.append(facet_index)
+        else:
+            raise RuntimeError(f"Unexpected original exterior facet tag {original_tag}.")
+
+    unassigned = sorted(original_gas_facets - assignments)
+    multiply_assigned = 0
+    coverage_residual = len(assignments) - len(original_gas_facets)
+    if ties or unassigned or multiply_assigned or coverage_residual or outer_contamination:
+        raise RuntimeError(
+            "Regional gas-facet validation failed: "
+            f"ties={len(ties)}, unassigned={len(unassigned)}, "
+            f"multiply_assigned={multiply_assigned}, coverage_residual={coverage_residual}, "
+            f"outer_contamination={len(outer_contamination)}."
+        )
+
+    regional_dS = dolfin.Measure("exterior_facet", domain=mesh, subdomain_data=regional)
+    lengths = {
+        f"A{acinus_id}": float(dolfin.assemble(
+            dolfin.Constant(1.0) * regional_dS(REGIONAL_GAS_TAGS[acinus_id])
+        ))
+        for acinus_id in sorted(REGIONAL_GAS_TAGS)
+    }
+    report = {
+        "metadata_file": str(ACINAR_METADATA_JSON),
+        "ownership_rule": "facet midpoint -> minimum-image nearest canonical seed -> acinus_id",
+        "regional_tags": {f"A{key}": value for key, value in REGIONAL_GAS_TAGS.items()},
+        "facet_counts": counts,
+        "facet_lengths": lengths,
+        "total_original_gas_facets": len(original_gas_facets),
+        "total_regional_gas_facets": len(assignments),
+        "coverage_residual": coverage_residual,
+        "unassigned_gas_facets": len(unassigned),
+        "multiply_assigned_gas_facets": multiply_assigned,
+        "outer_periodic_facets_in_regional_tags": len(outer_contamination),
+        "nearest_seed_ties": len(ties),
+        "tie_squared_distance_tolerance": GAS_FACET_TIE_TOLERANCE,
+    }
+    print("regional gas-facet ownership:")
+    for acinus_id in sorted(REGIONAL_GAS_TAGS):
+        print(
+            f"  A{acinus_id}: tag={REGIONAL_GAS_TAGS[acinus_id]} "
+            f"facets={counts[f'A{acinus_id}']} length={lengths[f'A{acinus_id}']:.16e}"
+        )
+    print(
+        f"  total={len(assignments)} coverage_residual={coverage_residual} "
+        f"ties={len(ties)} outer_contamination={len(outer_contamination)}"
+    )
+    return regional, regional_dS, report
 
 
 def assemble_patch_loading(mesh, domains, marker_document):
@@ -290,17 +431,27 @@ def run():
     mesh, domains, marker_document = load_mesh_and_markers()
     dx, mass_report = assemble_patch_loading(mesh, domains, marker_document)
     boundaries, points, vertices, bbox = make_boundary_markers(mesh)
+    regional_gas_boundaries, regional_gas_dS, gas_facet_report = (
+        make_regional_gas_boundary_markers(mesh, boundaries)
+    )
+    (RESULTS / "regional_gas_facets.json").write_text(
+        json.dumps(gas_facet_report, indent=2)
+    )
 
     material = {
         "skel": {"parameters": copy.deepcopy(MATERIAL_PARAMETERS), "scaling": "no"},
         "bulk": {"parameters": copy.deepcopy(MATERIAL_PARAMETERS), "scaling": "no"},
         "pore": {"parameters": copy.deepcopy(MATERIAL_PARAMETERS), "scaling": "no"},
     }
+    use_regional_boundary_measure = (
+        GAS_PRESSURE_MODE == "regional" or USE_REGIONAL_GAS_BOUNDARY_MEASURE_FOR_GLOBAL
+    )
+    active_boundaries = regional_gas_boundaries if use_regional_boundary_measure else boundaries
     problem = dmech.MicroPoroFlowHyperelasticityProblem(
         mesh=mesh,
         vertices=vertices,
         domains_mf=domains,
-        boundaries_mf=boundaries,
+        boundaries_mf=active_boundaries,
         points_mf=points,
         displacement_perturbation_degree=2,
         quadrature_degree=6,
@@ -324,20 +475,77 @@ def run():
         dt_min=STEP_PARAMETERS["dt_min"],
         dt_max=STEP_PARAMETERS["dt_max"],
     )
-    problem.add_surface_pressure_loading_operator(
-        measure=problem.dS(0), P_ini=0.0, P_fin=0.0, k_step=step_index
+    gas_measures = (
+        [problem.dS(REGIONAL_GAS_TAGS[index]) for index in range(4)]
+        if use_regional_boundary_measure else [problem.dS(0)]
     )
+    gas_pressure_operators = []
+    if GAS_PRESSURE_MODE == "global":
+        if use_regional_boundary_measure:
+            component_operators = [
+                dmech.SurfacePressureLoadingOperator(
+                    U_test=problem.displacement_perturbation_subsol.dsubtest,
+                    kinematics=problem.kinematics,
+                    N=problem.mesh_normals,
+                    measure=measure,
+                    P_ini=0.0,
+                    P_fin=float(GLOBAL_GAS_PRESSURE),
+                )
+                for measure in gas_measures
+            ]
+            gas_pressure_operators.append(problem.add_operator(
+                OperatorSumAdapter(component_operators), k_step=step_index
+            ))
+        else:
+            gas_pressure_operators.append(problem.add_surface_pressure_loading_operator(
+                measure=gas_measures[0], P_ini=0.0, P_fin=float(GLOBAL_GAS_PRESSURE),
+                k_step=step_index,
+            ))
+    elif GAS_PRESSURE_MODE == "regional":
+        if len(REGIONAL_GAS_PRESSURES) != 4:
+            raise RuntimeError("REGIONAL_GAS_PRESSURES must contain exactly four values.")
+        for acinus_id, pressure in enumerate(REGIONAL_GAS_PRESSURES):
+            gas_pressure_operators.append(problem.add_surface_pressure_loading_operator(
+                measure=regional_gas_dS(REGIONAL_GAS_TAGS[acinus_id]),
+                P_ini=0.0,
+                P_fin=float(pressure),
+                k_step=step_index,
+            ))
+    else:
+        raise RuntimeError(f"Unknown GAS_PRESSURE_MODE={GAS_PRESSURE_MODE!r}.")
     for i in range(2):
         for j in range(2):
             problem.add_macroscopic_stretch_component_penalty_operator(
-                i=i, j=j, U_bar_ij_ini=0.0, U_bar_ij_fin=0.0, pen_val=1e6,
+                i=i, j=j, U_bar_ij_ini=0.0,
+                U_bar_ij_fin=MACROSCOPIC_DISPLACEMENT_GRADIENT[i][j], pen_val=1e6,
                 k_step=step_index,
             )
-    problem.add_surface_area_operator(measure=problem.dS(0), k_step=step_index)
-    problem.add_surface_tension_loading_operator(
-        measure=problem.dS(0), gamma_ini=0.0, gamma_fin=0.0,
-        tension_params={}, k_step=step_index,
-    )
+    if use_regional_boundary_measure:
+        problem.add_operator(UnionDeformedSurfaceAreaOperator(
+            S_area=problem.surface_area_subsol.subfunc,
+            S_area_test=problem.surface_area_subsol.dsubtest,
+            kinematics=problem.kinematics,
+            N=problem.mesh_normals,
+            measures=gas_measures,
+        ), k_step=step_index)
+        problem.add_operator(OperatorSumAdapter([
+            dmech.SurfaceTensionLoadingOperator(
+                kinematics=problem.kinematics,
+                N=problem.mesh_normals,
+                U_test=problem.U_tot_test,
+                measure=measure,
+                gamma_ini=0.0,
+                gamma_fin=0.0,
+                tension_params={},
+            )
+            for measure in gas_measures
+        ]), k_step=step_index)
+    else:
+        problem.add_surface_area_operator(measure=gas_measures[0], k_step=step_index)
+        problem.add_surface_tension_loading_operator(
+            measure=gas_measures[0], gamma_ini=0.0, gamma_fin=0.0,
+            tension_params={}, k_step=step_index,
+        )
 
     # Exactly one Darcy operator: full-domain conductivity/coupling/outputs,
     # with its built-in single inlet/outlet slots intentionally disabled.
@@ -383,8 +591,12 @@ def run():
     problem.add_deformed_volume_qoi()
     problem.add_macroscopic_stretch_qois()
     problem.add_macroscopic_solid_stress_qois()
-    problem.add_macroscopic_stress_qois()
-    problem.add_fluid_pressure_qoi()
+    # These legacy QoIs select the first gas-pressure operator and are only
+    # meaningful for a single uniform gas pressure. They do not enter the FE
+    # residual and are intentionally omitted for regional-pressure cases.
+    if GAS_PRESSURE_MODE == "global":
+        problem.add_macroscopic_stress_qois()
+        problem.add_fluid_pressure_qoi()
     problem.add_interfacial_surface_qois()
     problem.add_darcy_qois()
     problem.add_foi(
@@ -408,6 +620,22 @@ def run():
         "Theta": {key: row["Theta"] for key, row in mass_report["patches"].items()},
         "pbar_l": 0.0,
         "macro_pressure_gradient": [0.0, 0.0],
+        "macroscopic_displacement_gradient": MACROSCOPIC_DISPLACEMENT_GRADIENT,
+        "gas_pressure_mode": GAS_PRESSURE_MODE,
+        "global_gas_pressure": float(GLOBAL_GAS_PRESSURE),
+        "regional_gas_pressures": [float(value) for value in REGIONAL_GAS_PRESSURES],
+        "gas_pressure_operator_count": len(gas_pressure_operators),
+        "active_boundary_measure": (
+            "regional gas tags 10-13 with original outer tags 1-4"
+            if use_regional_boundary_measure
+            else "original global gas tag 0 with outer tags 1-4"
+        ),
+        "regional_gas_facet_report": gas_facet_report,
+        "regional_gas_qoi_policy": (
+            "legacy gas-pressure-dependent QoIs enabled"
+            if GAS_PRESSURE_MODE == "global"
+            else "legacy add_fluid_pressure_qoi/add_macroscopic_stress_qois omitted"
+        ),
         "material_parameters": MATERIAL_PARAMETERS,
         "permeability_parameters": FLOW_PARAMETERS,
         "porosity_parameters": POROSITY_PARAMETERS,
