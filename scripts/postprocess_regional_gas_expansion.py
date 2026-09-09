@@ -178,6 +178,16 @@ def regional_gas_areas(coordinates, topology, displacement, metadata, Fbar):
     if np.any(reference_cell_area <= 0.0) or np.any(current_cell_area <= 0.0):
         raise RuntimeError("A canonical gas pore has nonpositive polygon area.")
     rows = []
+    periodic_deformed_coordinates = (
+        origin + (Fbar @ (coordinates - origin).T).T + canonical_perturbation
+    )
+    deformed_triangles = periodic_deformed_coordinates[topology]
+    geometric_wall_area = float(
+        0.5 * np.abs(np.cross(
+            deformed_triangles[:, 1] - deformed_triangles[:, 0],
+            deformed_triangles[:, 2] - deformed_triangles[:, 0],
+        )).sum()
+    )
     for acinus_id in range(4):
         mask = cell_acini == acinus_id
         rows.append({
@@ -199,6 +209,7 @@ def regional_gas_areas(coordinates, topology, displacement, metadata, Fbar):
         ),
         "reference_gas_area": float(reference_cell_area.sum()),
         "current_gas_area": float(current_cell_area.sum()),
+        "periodically_canonicalized_geometric_wall_area": geometric_wall_area,
         "per_cell_reference_area": reference_cell_area.tolist(),
         "per_cell_current_area": current_cell_area.tolist(),
     }
@@ -299,6 +310,9 @@ def process_case(case_name, case_dir, solution_xdmf, reference_current_areas, wr
             "mean_J": float(fields["J_tot"].mean()),
             "max_J": float(fields["J_tot"].max()),
             "global_current_wall_area": float(sum(row["current_wall_area"] for row in gas_rows)),
+            "periodically_canonicalized_geometric_wall_area": gas_validation[
+                "periodically_canonicalized_geometric_wall_area"
+            ],
         },
     }
     if write_output:
