@@ -19,3 +19,10 @@ data/
 *.geo
 *.json
 *.pkl
+
+# Mesh files (fingerprinted in geometry_manifest/)
+mesh/
+
+# Field output
+*.vtu
+*.pvd
