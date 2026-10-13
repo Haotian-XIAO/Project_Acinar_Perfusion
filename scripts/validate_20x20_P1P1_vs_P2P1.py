@@ -24,6 +24,7 @@ import test_acinar_perfusion_vascular_baseline as baseline
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "results" / "fe_order_validation_20x20"
+GEOMETRY = "G20"
 CASES = {"p2p1": (2, 1), "p1p1": (1, 1)}
 
 
@@ -85,6 +86,7 @@ def run_case(name):
     original_class = baseline.dmech.MicroPoroFlowHyperelasticityProblem
     original_results, original_base = baseline.RESULTS, baseline.RESULT_BASE
     original_write = baseline.write_final_vtu
+    baseline.select_geometry(GEOMETRY)
     baseline.RESULTS, baseline.RESULT_BASE = case_dir, case_dir / name
     baseline.dmech.MicroPoroFlowHyperelasticityProblem = custom_class
 
@@ -130,7 +132,7 @@ def run_case(name):
     # Same regional postprocessor/metadata as the baseline; only output directory differs.
     import postprocess_regional_perfusion as regional
     regional.run(case_dir, case_dir / f"{name}.xdmf", case_dir / "final_fields.vtu",
-                 baseline.ACINAR_METADATA_JSON, ROOT / "results" / "acinar_partition_20x20" / "periodic_acinar_summary.json")
+                 baseline.ACINAR_METADATA_JSON, baseline.GEOMETRIES[GEOMETRY]["acinar_summary"])
     return report
 
 
