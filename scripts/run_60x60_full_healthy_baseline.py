@@ -71,7 +71,7 @@ def write_projected_metadata(mesh,domains,problem,darcy):
                'macro_zero_verified':bool(np.max(abs(macro))<1e-10),'local_displacement_free_and_nonzero':bool(np.linalg.norm(U,axis=1).max()>0)}
     dims={s.name:int(s.func.function_space().dim()) for s in problem.subsols}
     (RESULTS/'mechanical_qois.json').write_text(json.dumps(mechanics,indent=2)+'\n')
-    (RESULTS/'space_report.json').write_text(json.dumps({'mixed_dofs':int(problem.solfunc.function_space().dim()),'subspace_dofs':dims,'mesh_vertices':mesh.num_vertices(),'mesh_cells':mesh.num_cells()},indent=2)+'\n')
+    (RESULTS/'space_report.json').write_text(json.dumps({'mixed_dofs':int(problem.sol_func.function_space().dim()),'subspace_dofs':dims,'mesh_vertices':mesh.num_vertices(),'mesh_cells':mesh.num_cells()},indent=2)+'\n')
 
 def translated_ownership_files():
     own=json.loads(OWNERSHIP.read_text()); cut=np.load(str(ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_Directional_CutOptimized_directional_metadata.npz'))['periodic_cut_origin']; L=5/3
