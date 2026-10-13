@@ -119,7 +119,7 @@ def run_case(name):
     report = {
         "case": name, "requested": {"U_tilde": ["CG", u_degree], "p_l": ["CG", p_degree]},
         "instantiated_subspaces": fields,
-        "mixed_dofs": int(problem.solfunc.function_space().dim()),
+        "mixed_dofs": int(problem.sol_func.function_space().dim()),
         "wall_time_seconds": elapsed,
         "ru_maxrss_before": int(rss_before),
         "ru_maxrss_after": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
