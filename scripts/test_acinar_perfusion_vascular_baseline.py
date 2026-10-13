@@ -7,6 +7,7 @@ project-local source-only residual operators.  It does not modify dolfin_mech.
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -19,10 +20,30 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MESH_BASE = ROOT / "mesh" / "Mesh_Acinar_Perfusion_VascularMarkers"
-MARKER_JSON = Path(str(MESH_BASE) + "_vascular_markers.json")
-ACINAR_METADATA_JSON = ROOT / "results" / "acinar_partition" / "periodic_acinar_metadata.json"
-RESULTS = ROOT / "results" / "vascular_baseline"
+
+# Geometry registry: each entry fixes the complete set of geometry-defining
+# inputs (mesh, vascular marker map, acinar partition) that belong together.
+GEOMETRIES = {
+    "G12": {
+        "mesh_base": ROOT / "mesh" / "Mesh_Acinar_Perfusion_VascularMarkers",
+        "marker_json": ROOT / "mesh" / "Mesh_Acinar_Perfusion_VascularMarkers_vascular_markers.json",
+        "acinar_metadata": ROOT / "results" / "acinar_partition" / "periodic_acinar_metadata.json",
+        "acinar_summary": ROOT / "results" / "acinar_partition" / "periodic_acinar_summary.json",
+    },
+    "G20": {
+        "mesh_base": ROOT / "mesh" / "Mesh_Acinar_Perfusion_Periodic_20x20_VascularMarkers",
+        "marker_json": ROOT / "mesh" / "Mesh_Acinar_Perfusion_Periodic_20x20_VascularMarkers_vascular_markers.json",
+        "acinar_metadata": ROOT / "results" / "acinar_partition_20x20" / "periodic_acinar_metadata.json",
+        "acinar_summary": ROOT / "results" / "acinar_partition_20x20" / "periodic_acinar_summary.json",
+    },
+}
+DEFAULT_GEOMETRY = "G12"
+
+MESH_BASE = GEOMETRIES[DEFAULT_GEOMETRY]["mesh_base"]
+MARKER_JSON = GEOMETRIES[DEFAULT_GEOMETRY]["marker_json"]
+ACINAR_METADATA_JSON = GEOMETRIES[DEFAULT_GEOMETRY]["acinar_metadata"]
+DEFAULT_RESULTS = ROOT / "results" / "vascular_baseline"
+RESULTS = DEFAULT_RESULTS
 RESULT_BASE = RESULTS / "vascular_baseline"
 
 Q_TOTAL = 1.0
@@ -146,7 +167,10 @@ def load_mesh_and_markers():
 
 
 def make_boundary_markers(mesh):
-    coordinates = mesh.coordinates()
+    # DOLFIN stores planar coordinates in a three-column array even when the
+    # mesh geometric dimension is two; the zero z column is not a boundary
+    # coordinate for this 2-D problem.
+    coordinates = mesh.coordinates()[:, :2]
     xmin, ymin = coordinates.min(axis=0)
     xmax, ymax = coordinates.max(axis=0)
     tol = 1e-8
@@ -335,7 +359,7 @@ def project_vector_cell_data(expr, mesh):
 
 
 def write_final_vtu(mesh, domains, problem, darcy_operator):
-    points = np.column_stack([mesh.coordinates(), np.zeros(mesh.num_vertices())])
+    points = np.column_stack([mesh.coordinates()[:, :2], np.zeros(mesh.num_vertices())])
     triangles = np.asarray(mesh.cells(), dtype=int)
     p_l = project_scalar_cell_data(darcy_operator.pl_tot, mesh)
     p_tilde = project_scalar_cell_data(problem.pl_perturbation_subsol.subfunc, mesh)
@@ -426,8 +450,41 @@ def parse_increment_table(path):
     return rows
 
 
+def select_geometry(name, mesh_base=None, marker_json=None, acinar_metadata=None):
+    """Set the module-level geometry inputs from the registry, with optional overrides."""
+    global MESH_BASE, MARKER_JSON, ACINAR_METADATA_JSON
+    if mesh_base is not None and acinar_metadata is None:
+        raise ValueError("A mesh override requires an explicit acinar metadata file.")
+    entry = GEOMETRIES[name]
+    MESH_BASE = ROOT / mesh_base if mesh_base is not None else entry["mesh_base"]
+    if marker_json is not None:
+        MARKER_JSON = ROOT / marker_json
+    elif mesh_base is not None:
+        MARKER_JSON = Path(str(MESH_BASE) + "_vascular_markers.json")
+    else:
+        MARKER_JSON = entry["marker_json"]
+    ACINAR_METADATA_JSON = ROOT / acinar_metadata if acinar_metadata is not None else entry["acinar_metadata"]
+
+
+def repo_relative(path):
+    path = Path(path)
+    return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+
+
+def geometry_inputs():
+    """Geometry inputs actually in use, labelled with the matching registry key or 'custom'."""
+    used = {"mesh_base": MESH_BASE, "marker_json": MARKER_JSON, "acinar_metadata": ACINAR_METADATA_JSON}
+    label = next(
+        (name for name, entry in GEOMETRIES.items() if all(entry[key] == value for key, value in used.items())),
+        "custom",
+    )
+    return {"geometry": label, **{key: repo_relative(value) for key, value in used.items()}}
+
+
 def run():
     RESULTS.mkdir(parents=True, exist_ok=True)
+    geometry = geometry_inputs()
+    print("Geometry inputs: " + json.dumps(geometry, indent=2))
     mesh, domains, marker_document = load_mesh_and_markers()
     dx, mass_report = assemble_patch_loading(mesh, domains, marker_document)
     boundaries, points, vertices, bbox = make_boundary_markers(mesh)
@@ -609,6 +666,7 @@ def run():
     )
 
     run_config = {
+        "geometry_inputs": geometry,
         "mesh_filebasename": str(MESH_BASE),
         "mesh_files": [str(Path(str(MESH_BASE) + suffix)) for suffix in (
             ".msh", ".xdmf", ".h5", "_domains.xdmf", "_domains.h5",
@@ -758,6 +816,26 @@ def run():
     print(json.dumps({"diagnostics": diagnostics, "patch_pressures": pressure_report}, indent=2))
 
 
+def main(argv=None):
+    """Command-line entry point; with no arguments it runs the accepted G12 case."""
+    global RESULTS, RESULT_BASE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--geometry", choices=sorted(GEOMETRIES), default=DEFAULT_GEOMETRY,
+                        help="registered geometry: selects mesh, marker JSON and acinar metadata together")
+    parser.add_argument("--mesh", type=Path, help="override: mesh base path without suffix (repository-relative)")
+    parser.add_argument("--marker-json", type=Path, help="override: vascular marker JSON (repository-relative)")
+    parser.add_argument("--acinar-metadata", type=Path, help="override: periodic_acinar_metadata.json (repository-relative)")
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS,
+                        help="output directory (repository-relative)")
+    args = parser.parse_args(argv)
+    if args.mesh is not None and args.acinar_metadata is None:
+        parser.error("--mesh and --acinar-metadata must be given together")
+    select_geometry(args.geometry, args.mesh, args.marker_json, args.acinar_metadata)
+    RESULTS = ROOT / args.results_dir
+    RESULT_BASE = RESULTS / "vascular_baseline"
+    run()
+
+
 if __name__ == "__main__":
     os.chdir(ROOT)
-    run()
+    main()
