@@ -3,10 +3,13 @@
 
 Before the target is imported, this records ``run_meta.json`` (code versions,
 environment, command, parameters, geometry fingerprints) and aborts if
-``dolfin_mech`` is not imported from the expected checkout or if a geometry
-input does not match ``geometry_manifest/geometry.md5``.  The final ``STATUS``
-is written by the calling shell layer (``start_run.sh``), which also sees
-signal deaths that Python cannot report.
+``dolfin_mech`` is not imported from the expected checkout, if a geometry
+input does not match ``geometry_manifest/geometry.md5``, or if any metadata
+item cannot be determined (recorded as null plus an error, never a default).
+Git state is read from ``git_state.json``, written by ``start_run.sh`` in the
+native shell: under Rosetta, Python child processes cannot run the system git
+(xcrun) tools.  The final ``STATUS`` is written by the calling shell layer,
+which also sees signal deaths that Python cannot report.
 
 Usage (from the repository root):
     python scripts/tools/run_with_meta.py --run-dir results/<study>/<run_id> \
@@ -38,21 +41,36 @@ def now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def git_state(path):
-    def git(*args):
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True).stdout.strip()
-    return {
-        "commit": git("rev-parse", "HEAD") or None,
-        "branch": git("rev-parse", "--abbrev-ref", "HEAD") or None,
-        "dirty": bool(git("status", "--porcelain")),
-    }
+def load_git_state(run_dir, errors):
+    """Git state captured by start_run.sh; any missing item is an error."""
+    path = run_dir / "git_state.json"
+    if not path.exists():
+        errors.append(f"missing {path.name} (written by start_run.sh)")
+        return {"repo": None, "dolfin_mech": None}
+    state = json.loads(path.read_text())
+    for key in ("repo", "dolfin_mech"):
+        entry = state.get(key)
+        if not entry or entry.get("commit") is None or entry.get("dirty") is None:
+            errors.append(f"git state of {key} unknown: {entry.get('error') if entry else 'not recorded'}")
+    return state
 
 
-def rosetta_translated():
+def rosetta_translated(errors):
     if sys.platform != "darwin":
-        return None
+        return {"value": None, "error": f"not applicable on {sys.platform}"}
     result = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True)
-    return result.stdout.strip() == "1" if result.returncode == 0 else None
+    if result.returncode != 0 or result.stdout.strip() not in ("0", "1"):
+        error = f"sysctl.proc_translated failed (exit {result.returncode}): {result.stderr.strip()}"
+        errors.append(error)
+        return {"value": None, "error": error}
+    return {"value": result.stdout.strip() == "1", "error": None}
+
+
+def required_env(name, errors):
+    value = os.environ.get(name)
+    if not value:
+        errors.append(f"environment variable {name} is not set")
+    return value
 
 
 def md5(path):
@@ -98,9 +116,9 @@ def parse_args(argv):
     parser.add_argument("--geometry-file", action="append", default=[],
                         help="repository-relative path or glob of manifest entries used by the run")
     parser.add_argument("--param", action="append", default=[], help="KEY=VALUE recorded in run_meta.json")
-    parser.add_argument("--study")
-    parser.add_argument("--run-id")
-    parser.add_argument("--host-label")
+    parser.add_argument("--study", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--host-label", required=True)
     args = parser.parse_args(argv[:split])
     target = argv[split + 1:]
     if not target:
@@ -126,6 +144,8 @@ def run(args, target, run_dir):
 
     def redact(value):
         # Keep usernames and machine paths out of metadata that may be shared.
+        if value is None:
+            return None
         text = str(value)
         for old, new in replacements:
             text = text.replace(old, new)
@@ -133,8 +153,15 @@ def run(args, target, run_dir):
 
     target_args = [arg.replace("{run_dir}", os.path.relpath(run_dir, ROOT)) for arg in target[1:]]
     target_path = (ROOT / target[0]).resolve()
-    params = dict(item.split("=", 1) for item in args.param)
     errors = []
+    params = {}
+    for item in args.param:
+        if "=" not in item:
+            errors.append(f"--param {item!r} is not KEY=VALUE")
+            continue
+        key, value = item.split("=", 1)
+        params[key] = value
+    git = load_git_state(run_dir, errors)
 
     import dolfin
     import dolfin_mech
@@ -154,31 +181,37 @@ def run(args, target, run_dir):
         "command": [redact(arg) for arg in [sys.executable, *sys.argv]],
         "target": {"script": redact(target_path), "args": [redact(arg) for arg in target_args]},
         "parameters": params,
-        "repo": git_state(ROOT),
+        "repo": git["repo"],
         "dolfin_mech": {
             "file": redact(dolfin_mech_file),
             "expected_checkout": "<DOLFIN_MECH>",
             "inside_expected_checkout": dolfin_mech_ok,
-            **git_state(expected),
+            "git": git["dolfin_mech"],
         },
         "dolfin_version": dolfin.__version__,
         "environment": {
-            "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
-            "conda_prefix": redact(os.environ.get("CONDA_PREFIX", "")),
+            "conda_env": required_env("CONDA_DEFAULT_ENV", errors),
+            "conda_prefix": redact(required_env("CONDA_PREFIX", errors)),
             "python": platform.python_version(),
             "python_executable": redact(sys.executable),
             "platform_machine": platform.machine(),
-            "rosetta_translated": rosetta_translated(),
-            "pythonpath": redact(os.environ.get("PYTHONPATH", "")),
+            "rosetta_translated": rosetta_translated(errors),
+            "pythonpath": redact(required_env("PYTHONPATH", errors)),
         },
         "geometry_manifest": os.path.relpath(args.manifest.resolve(), ROOT),
+        "geometry_check": "requested" if args.geometry_file else "not requested",
         "geometry_files": geometry_files,
         "preflight_errors": errors,
     }
     meta_path = run_dir / "run_meta.json"
 
+    for entry in (git["repo"], git["dolfin_mech"]):
+        if entry and entry.get("error"):
+            entry["error"] = redact(entry["error"])
+
     def write_meta():
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        shown = dict(meta, preflight_errors=[redact(error) for error in errors])
+        meta_path.write_text(json.dumps(shown, indent=2) + "\n")
 
     write_meta()
     print("run_meta.json written:", os.path.relpath(meta_path, ROOT), flush=True)

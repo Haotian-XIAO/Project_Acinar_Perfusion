@@ -3,20 +3,23 @@
 #
 # Usage (from anywhere; normally called by launch_remote_run.sh over ssh):
 #   start_run.sh --conda-sh FILE --dolfin-mech DIR --study NAME --label LABEL \
-#       [--env NAME] [--host-label LABEL] \
+#       --host-label LABEL [--env NAME] \
 #       [run_with_meta.py options: --geometry-file P | --param K=V ...] \
 #       -- <target.py> [target args...]
 #
 # Creates results/<study>/<YYYYMMDD-HHMM>_<label>/ (refuses to reuse it), writes
-# STATUS=RUNNING, job.sh and job.pid, launches job.sh under nohup caffeinate -i
-# and returns at once. job.sh replaces STATUS by DONE or "FAILED <exit code>";
+# STATUS=RUNNING, git_state.json, job.sh and job.pid, launches job.sh under
+# nohup caffeinate -i and returns at once. Git state is captured here, in the
+# native shell, because Python running under Rosetta cannot call the system
+# git (xcrun); a failed capture is recorded as null plus the error text.
+# job.sh replaces STATUS by DONE or "FAILED <exit code>";
 # exit codes > 128 are signal deaths (e.g. 137 = SIGKILL); once dolfin is imported,
 # PETSc catches SIGSEGV/SIGBUS/SIGFPE and exits with 59 ("PETSC ERROR" in run.log).
 # run_with_meta.py exits with 2 when a pre-flight check fails (see run_meta.json).
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-conda_sh= dolfin_mech= study= label= env_name=dolfin_mech host_label=unspecified
+conda_sh= dolfin_mech= study= label= env_name=dolfin_mech host_label=
 meta_args=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -32,7 +35,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ $# -gt 0 ] || { echo "start_run.sh: missing '-- <target.py> [args]'" >&2; exit 64; }
-for name in conda_sh dolfin_mech study label; do
+for name in conda_sh dolfin_mech study label host_label; do
     [ -n "${!name}" ] || { echo "start_run.sh: --${name//_/-} is required" >&2; exit 64; }
 done
 case "$study$label" in */*|*' '*) echo "start_run.sh: study/label must not contain '/' or spaces" >&2; exit 64 ;; esac
@@ -50,6 +53,18 @@ mkdir -p "results/$study"
 mkdir "$run_rel" 2>/dev/null || { echo "start_run.sh: run directory exists, refusing to reuse: $run_rel" >&2; exit 66; }
 run_dir="$repo/$run_rel"
 echo RUNNING > "$run_dir/STATUS"
+
+json_string() { printf '"%s"' "$(printf '%s' "$1" | tr '\t\r' '  ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'NR>1{printf "\\n"} {printf "%s", $0}')"; }
+git_json() {
+    local dir=$1 commit branch status dirty
+    commit=$(git -C "$dir" rev-parse HEAD 2>&1) || { printf '{"commit": null, "branch": null, "dirty": null, "error": %s}' "$(json_string "git rev-parse HEAD: $commit")"; return; }
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>&1) || { printf '{"commit": null, "branch": null, "dirty": null, "error": %s}' "$(json_string "git rev-parse --abbrev-ref HEAD: $branch")"; return; }
+    status=$(git -C "$dir" status --porcelain 2>&1) || { printf '{"commit": null, "branch": null, "dirty": null, "error": %s}' "$(json_string "git status --porcelain: $status")"; return; }
+    dirty=false; [ -z "$status" ] || dirty=true
+    printf '{"commit": "%s", "branch": %s, "dirty": %s, "status_porcelain": %s, "error": null}' "$commit" "$(json_string "$branch")" "$dirty" "$(json_string "$status")"
+}
+printf '{\n  "captured_by": "start_run.sh",\n  "captured_at": "%s",\n  "repo": %s,\n  "dolfin_mech": %s\n}\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$(git_json "$repo")" "$(git_json "$dolfin_mech")" > "$run_dir/git_state.json"
 
 q() { printf '%q ' "$@"; }
 meta_str=

@@ -16,7 +16,7 @@ parser.add_argument("--raise-error", action="store_true", help="raise a RuntimeE
 args = parser.parse_args()
 print("python", sys.version.split()[0])
 print("dolfin", dolfin.__version__)
-print("dolfin_mech", getattr(dolfin_mech, "__version__", "unknown"))
+print("dolfin_mech __version__:", getattr(dolfin_mech, "__version__", None))
 time.sleep(args.sleep)
 if args.signal:
     print("sending signal", args.signal, flush=True)
