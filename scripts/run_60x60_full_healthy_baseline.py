@@ -13,6 +13,10 @@ Pa conversion, or intrinsic k is invented here.
 output, metadata, regional post-processing) on a small registered geometry
 with that geometry's established loading (Q_total = 1.0), for end-to-end
 rehearsals before a G60 run.  The default is G60.
+
+--alpha-pa2 A sets the Pa2 arterial suppression at unchanged total flow:
+Q_Pa2 = (A/4) Q_total, Q_Pa0 = Q_Pa1 = Q_Pa3 = (4 - A)/12 Q_total, venous
+sinks Q_total/2 each.  Without it the healthy equal split is used.
 """
 from __future__ import annotations
 import argparse, json, os, time
@@ -38,6 +42,16 @@ FLOWS={'Pa0':Q_TOTAL/4,'Pa1':Q_TOTAL/4,'Pa2':Q_TOTAL/4,'Pa3':Q_TOTAL/4,'V002':Q_
 # Rehearsal geometries: registered in the vascular driver, run with their established loading.
 REHEARSAL_Q_TOTAL=1.0
 GEOMETRY='G60'
+ALPHA_PA2=None
+
+def healthy_flows(q_total):
+    return {'Pa0':q_total/4,'Pa1':q_total/4,'Pa2':q_total/4,'Pa3':q_total/4,'V002':q_total/2,'V006':q_total/2}
+
+def alpha_flows(q_total,alpha):
+    """Pa2 suppression at fixed total flow; Pa0, Pa1 and Pa3 share the remainder equally."""
+    if not 0.0<=alpha<=1.0: raise ValueError(f'alpha_Pa2 must lie in [0, 1], got {alpha}')
+    compensated=(4.0-alpha)/12.0*q_total
+    return {'Pa0':compensated,'Pa1':compensated,'Pa2':alpha/4.0*q_total,'Pa3':compensated,'V002':q_total/2,'V006':q_total/2}
 
 def iterative_foi_projection(self):
     """L2-project a field of interest without UMFPACK factorization.
@@ -144,15 +158,19 @@ def unit_audit():
     return {'geometry':GEOMETRY,'purpose':'rehearsal of the G60 script code path on a registered small geometry; no physical calibration','coordinate_unit':'model length of the registered geometry; no physical length claimed','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_model':Q_TOTAL,'physical_unit':None,'model_convention':'established dimensionless loading of this geometry','out_of_plane_depth':'not specified'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
 
 def main(argv=None):
-    global RESULTS,GEOMETRY,Q_TOTAL,FLOWS
+    global RESULTS,GEOMETRY,Q_TOTAL,FLOWS,ALPHA_PA2
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results-dir',type=Path,default=RESULTS.relative_to(ROOT),help='output directory (repository-relative)')
     parser.add_argument('--geometry',choices=('G60','G20','G12'),default='G60',help='G60 (default) or a registered small geometry for an end-to-end rehearsal of this code path')
+    parser.add_argument('--alpha-pa2',type=float,default=None,help='Pa2 arterial suppression alpha in [0, 1] at fixed Q_total (default: healthy equal split)')
     base.add_solver_option_arguments(parser,foi_default='iterative')
     args=parser.parse_args(argv)
-    RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry
+    RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry; ALPHA_PA2=args.alpha_pa2
     if GEOMETRY!='G60':
-        Q_TOTAL=REHEARSAL_Q_TOTAL; FLOWS={'Pa0':Q_TOTAL/4,'Pa1':Q_TOTAL/4,'Pa2':Q_TOTAL/4,'Pa3':Q_TOTAL/4,'V002':Q_TOTAL/2,'V006':Q_TOTAL/2}
+        Q_TOTAL=REHEARSAL_Q_TOTAL; FLOWS=healthy_flows(Q_TOTAL)
+    if ALPHA_PA2 is not None:
+        FLOWS=alpha_flows(Q_TOTAL,ALPHA_PA2)
+    case='healthy_baseline' if ALPHA_PA2 is None else f'alpha_Pa2_{ALPHA_PA2:g}'
     solver_options=base.solver_options_from_args(args,foi_default='iterative')
     # Files written by scripts/tools/start_run.sh and run_with_meta.py before this script starts.
     launcher_files={'STATUS','git_state.json','job.sh','job.pid','run.log','run_meta.json'}
@@ -161,11 +179,15 @@ def main(argv=None):
     RESULTS.mkdir(parents=True,exist_ok=True)
     unit=unit_audit()
     (RESULTS/'unit_audit.json').write_text(json.dumps(unit,indent=2)+'\n')
+    if ALPHA_PA2 is not None:
+        # Written before the solve so that an aborted run still records its loading case.
+        experiment={'suppressed_arterial_source':'Pa2','alpha_Pa2':ALPHA_PA2,'Q_total':Q_TOTAL,'target_flows':FLOWS,'definition':'Q_Pa2=(alpha/4) Q_total; Q_Pa0=Q_Pa1=Q_Pa3=(4-alpha)/12 Q_total; venous sinks Q_total/2 each'}
+        (RESULTS/'case_definition.json').write_text(json.dumps(experiment,indent=2)+'\n')
     if GEOMETRY=='G60':
         base.GEOMETRY_LABEL='G60'; base.ACINAR_METADATA_JSON=OWNERSHIP  # ownership is not read by the driver here (global gas pressure); recorded for identification
-        base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULT_BASE=RESULTS/'healthy_baseline_60x60'; base.load_mesh_and_markers=load_60_mesh_and_markers
+        base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULT_BASE=RESULTS/f'{case}_60x60'; base.load_mesh_and_markers=load_60_mesh_and_markers
     else:
-        base.select_geometry(GEOMETRY); base.GEOMETRY_LABEL=GEOMETRY; base.RESULT_BASE=RESULTS/f'healthy_baseline_{GEOMETRY}'
+        base.select_geometry(GEOMETRY); base.GEOMETRY_LABEL=GEOMETRY; base.RESULT_BASE=RESULTS/f'{case}_{GEOMETRY}'
     base.RESULTS=RESULTS; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.make_regional_gas_boundary_markers=global_gas_boundary_only
     if solver_options is None:
         base.dmech.FOI.update_project=iterative_foi_projection
@@ -173,7 +195,9 @@ def main(argv=None):
         base.SOLVER_OPTIONS=solver_options  # FOI projection, linear solver and diagnostics handled by the driver
     global old_write; old_write=base.write_final_vtu; base.write_final_vtu=write_projected_metadata
     start=time.perf_counter(); base.run(); wall=time.perf_counter()-start
-    cfg=json.loads((RESULTS/'run_config.json').read_text()); cfg['physical_loading']=unit['flow_mapping'];cfg['wall_time_seconds']=wall;cfg['macro_condition']='U_bar=0; F_bar=I; periodic local displacement fluctuations free';(RESULTS/'run_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
+    cfg=json.loads((RESULTS/'run_config.json').read_text()); cfg['physical_loading']=unit['flow_mapping'];cfg['wall_time_seconds']=wall;cfg['macro_condition']='U_bar=0; F_bar=I; periodic local displacement fluctuations free'
+    if ALPHA_PA2 is not None: cfg['experiment']=experiment
+    (RESULTS/'run_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
     postprocess()
     print(json.dumps({'status':'complete','wall_time_seconds':wall,'results':str(RESULTS)},indent=2))
 if __name__=='__main__': os.chdir(ROOT); main()
