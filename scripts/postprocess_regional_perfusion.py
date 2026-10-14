@@ -115,6 +115,26 @@ def periodic_cell_ownership(centroids, metadata, tie_tolerance=1e-12):
     return owner.astype(int), acinus_by_cell[owner], ambiguous.astype(int), squared_distance
 
 
+def periodic_cell_ownership_margin(centroids, metadata, tie_tolerance=1e-12, chunk_size=2000):
+    """``periodic_cell_ownership`` evaluated in row chunks, returning the ownership margin.
+
+    Identical per-triangle results without holding the full triangle-by-seed
+    arrays (for G60, 747,483 triangles x 3,600 seeds: 43 GB per coordinate-pair
+    array, several of which coexist in the unchunked function).
+    The margin is the second-nearest minus the nearest squared distance.
+    """
+    owners, acini, ambiguous, margins = [], [], [], []
+    for start in range(0, len(centroids), chunk_size):
+        owner, acinus, chunk_ambiguous, squared_distance = periodic_cell_ownership(
+            centroids[start:start + chunk_size], metadata, tie_tolerance)
+        sorted_distance = np.sort(squared_distance, axis=1)
+        owners.append(owner)
+        acini.append(acinus)
+        ambiguous.append(chunk_ambiguous + start)
+        margins.append(sorted_distance[:, 1] - sorted_distance[:, 0])
+    return np.concatenate(owners), np.concatenate(acini), np.concatenate(ambiguous), np.concatenate(margins)
+
+
 def triangle_quadrature(coordinates, topology, fields):
     vertices = coordinates[topology]
     edge_1 = vertices[:, 1] - vertices[:, 0]
@@ -321,7 +341,7 @@ def acinar_interface_segments(topology, coordinates, acinus_ids):
     return segments
 
 
-def make_figures(output_dir, coordinates, topology, acinus_ids, quadrature, rows, summary):
+def make_figures(output_dir, coordinates, topology, acinus_ids, quadrature, rows, summary, extent=(1.0, 1.0)):
     cell_q = quadrature["spatial_activity"] / quadrature["current_area"]
     fig, ax = plt.subplots(figsize=(8.5, 8.0))
     image = ax.tripcolor(
@@ -339,7 +359,7 @@ def make_figures(output_dir, coordinates, topology, acinus_ids, quadrature, rows
                 fontsize=11, weight="bold", color="black",
                 bbox={"facecolor": "white", "edgecolor": "black", "alpha": 0.78, "pad": 2})
     fig.colorbar(image, ax=ax, label=r"$|q_l|$ (cell current-area mean)")
-    ax.set(xlim=(0, 1), ylim=(0, 1), aspect="equal", xlabel="x", ylabel="y",
+    ax.set(xlim=(0, extent[0]), ylim=(0, extent[1]), aspect="equal", xlabel="x", ylabel="y",
            title="Continuous Darcy transport with FE-level acinar regions")
     fig.tight_layout()
     fig.savefig(output_dir / "regional_perfusion_map.png", dpi=250)
@@ -393,11 +413,15 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def run(result_dir, solution_xdmf, final_vtu, acinar_metadata_path, acinar_summary_path):
+def run(result_dir, solution_xdmf, final_vtu, acinar_metadata_path, acinar_summary_path,
+        accepted_partition_methods=("airway_constrained_space_filling",)):
     metadata = json.loads(acinar_metadata_path.read_text())
     summary = json.loads(acinar_summary_path.read_text())
-    if metadata.get("main_partition_method") != "airway_constrained_space_filling":
-        raise RuntimeError("Acinar metadata is not the accepted airway-constrained partition.")
+    if metadata.get("main_partition_method") not in accepted_partition_methods:
+        raise RuntimeError(
+            f"Acinar metadata partition method {metadata.get('main_partition_method')!r} "
+            f"is not one of the accepted methods {list(accepted_partition_methods)}."
+        )
     canonical_fractions = {
         int(item["acinus_id"]): float(item["area_fraction"])
         for item in summary["main_model"]["territories"]
@@ -405,9 +429,7 @@ def run(result_dir, solution_xdmf, final_vtu, acinar_metadata_path, acinar_summa
     final_time, coordinates, topology, fields = read_final_xdmf_fields(solution_xdmf)
     domain_ids = read_domain_markers(final_vtu, coordinates, topology)
     centroids = coordinates[topology].mean(axis=1)
-    canonical_ids, acinus_ids, ambiguous, distances = periodic_cell_ownership(centroids, metadata)
-    sorted_distances = np.sort(distances, axis=1)
-    ownership_margin = sorted_distances[:, 1] - sorted_distances[:, 0]
+    canonical_ids, acinus_ids, ambiguous, ownership_margin = periodic_cell_ownership_margin(centroids, metadata)
     near_boundary_counts = {
         "squared_distance_gap_le_1e-10": int(np.count_nonzero(ownership_margin <= 1e-10)),
         "squared_distance_gap_le_1e-8": int(np.count_nonzero(ownership_margin <= 1e-8)),
@@ -488,7 +510,9 @@ def run(result_dir, solution_xdmf, final_vtu, acinar_metadata_path, acinar_summa
     (result_dir / "fe_acinar_mapping.json").write_text(json.dumps(mapping, indent=2))
     (result_dir / "regional_perfusion.json").write_text(json.dumps(result, indent=2))
     write_csv(result_dir / "regional_perfusion.csv", rows)
-    make_figures(result_dir, coordinates, topology, acinus_ids, quadrature, rows, summary)
+    # Plot window: the periodic cell (G12: [0, 1]^2; G20 and G60: [0, 5/3]^2).
+    extent = (float(metadata["periodic_cell"]["a1"][0]), float(metadata["periodic_cell"]["a2"][1]))
+    make_figures(result_dir, coordinates, topology, acinus_ids, quadrature, rows, summary, extent)
     print(json.dumps(result, indent=2))
     return result
 

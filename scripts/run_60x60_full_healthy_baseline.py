@@ -8,6 +8,11 @@ no documented SI calibration.  The prescribed physical 0.667 mL/min is
 therefore represented by the explicit project convention Q_model=Q/(1
 mL/min), while its SI value is retained in metadata.  No out-of-plane depth,
 Pa conversion, or intrinsic k is invented here.
+
+--geometry G20/G12 runs this script's own code path (loading adapter, final
+output, metadata, regional post-processing) on a small registered geometry
+with that geometry's established loading (Q_total = 1.0), for end-to-end
+rehearsals before a G60 run.  The default is G60.
 """
 from __future__ import annotations
 import argparse, json, os, time
@@ -23,8 +28,16 @@ RESULTS=ROOT/'results/physiological_60x60_full_healthy_baseline_iterative_foi'
 MARKER_BASE=ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_vascular_markers'
 SITES=ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_vascular_sites.json'
 OWNERSHIP=ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_acinar_ownership.json'
+OWNERSHIP_NPZ=ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_acinar_ownership.npz'
+CUT_METADATA=ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_Directional_CutOptimized_directional_metadata.npz'
+# Partition label written into the translated metadata: the G60 ownership rule
+# (whole canonical cells, quadrants by polygon centroid), not the G12/G20 one.
+G60_PARTITION_METHOD='whole_canonical_cell_quadrant_by_polygon_centroid'
 Q_TOTAL=0.667
 FLOWS={'Pa0':Q_TOTAL/4,'Pa1':Q_TOTAL/4,'Pa2':Q_TOTAL/4,'Pa3':Q_TOTAL/4,'V002':Q_TOTAL/2,'V006':Q_TOTAL/2}
+# Rehearsal geometries: registered in the vascular driver, run with their established loading.
+REHEARSAL_Q_TOTAL=1.0
+GEOMETRY='G60'
 
 def iterative_foi_projection(self):
     """L2-project a field of interest without UMFPACK factorization.
@@ -58,53 +71,102 @@ def global_gas_boundary_only(mesh,boundaries):
     return boundaries,dolfin.Measure('exterior_facet',domain=mesh,subdomain_data=boundaries),{
         'status':'not_needed_for_global_zero_gas_pressure','global_gas_pressure':0.0}
 
+def macroscopic_displacement_gradient(problem,dV,area):
+    """Converged U_bar, evaluated from the mixed solution.
+
+    U_bar is a constant ("R") tensor subsolution.  In the mixed space its
+    ``subfunc`` is ``dolfin.split(sol_func)[k]``, a UFL ListTensor view without
+    a vector, so each component is evaluated as its domain mean (exact for a
+    constant).
+    """
+    U_bar=problem.macroscopic_stretch_subsol.subfunc
+    dim=problem.mesh.geometry().dim()
+    macro=np.array([[float(dolfin.assemble(U_bar[i,j]*dV))/area for j in range(dim)] for i in range(dim)])
+    if not np.all(np.isfinite(macro)): raise RuntimeError(f'Non-finite macroscopic displacement gradient: {macro.tolist()}')
+    return macro
+
 def write_projected_metadata(mesh,domains,problem,darcy):
     """Called after convergence by the unmodified established solver path."""
     old_write(mesh,domains,problem,darcy)
     dV=problem.dV; area=float(dolfin.assemble(dolfin.Constant(1.)*dV))
     J=base.project_scalar_cell_data(problem.kinematics.J,mesh)
     U=base.project_vector_cell_data(problem.U_tot,mesh)
-    macro=problem.macroscopic_stretch_subsol.subfunc.vector().get_local().reshape(-1)
+    macro=macroscopic_displacement_gradient(problem,dV,area)
     mechanics={'J_min':float(J.min()),'J_mean':float(np.dot(J, np.ones_like(J))/len(J)),'J_max':float(J.max()),
+               'J_mean_convention':'unweighted mean of DG0 cell values','J_area_weighted_mean':float(dolfin.assemble(problem.kinematics.J*dV))/area,
                'displacement_magnitude_min':float(np.linalg.norm(U,axis=1).min()),'displacement_magnitude_max':float(np.linalg.norm(U,axis=1).max()),
-               'macroscopic_displacement_gradient_flat':macro.tolist(),'F_bar':[[1.,0.],[0.,1.]],
+               'macroscopic_displacement_gradient_flat':macro.reshape(-1).tolist(),'macroscopic_displacement_gradient_convention':'row-major [U_bar_00, U_bar_01, U_bar_10, U_bar_11], domain mean of the converged mixed-solution component',
+               'F_bar':(np.eye(len(macro))+macro).tolist(),
                'macro_zero_verified':bool(np.max(abs(macro))<1e-10),'local_displacement_free_and_nonzero':bool(np.linalg.norm(U,axis=1).max()>0)}
     dims={s.name:int(s.func.function_space().dim()) for s in problem.subsols}
     (RESULTS/'mechanical_qois.json').write_text(json.dumps(mechanics,indent=2)+'\n')
     (RESULTS/'space_report.json').write_text(json.dumps({'mixed_dofs':int(problem.sol_func.function_space().dim()),'subspace_dofs':dims,'mesh_vertices':mesh.num_vertices(),'mesh_cells':mesh.num_cells()},indent=2)+'\n')
 
+def periodic_mean(points,L):
+    """Circular mean of points on the periodic square [0,L)^2 (label position only)."""
+    angle=2*np.pi*np.asarray(points)/L
+    return np.mod(np.arctan2(np.sin(angle).mean(axis=0),np.cos(angle).mean(axis=0))*L/(2*np.pi),L)
+
 def translated_ownership_files():
-    own=json.loads(OWNERSHIP.read_text()); cut=np.load(str(ROOT/'mesh/Mesh_Acinar_Perfusion_Physiological_60x60_Directional_CutOptimized_directional_metadata.npz'))['periodic_cut_origin']; L=5/3
+    """G60 ownership in the mesh (cut) frame, in the metadata/summary format of the regional post-processing."""
+    own=json.loads(OWNERSHIP.read_text()); npz=np.load(str(OWNERSHIP_NPZ)); cut_md=np.load(str(CUT_METADATA))
+    cut=cut_md['periodic_cut_origin']; L=float(cut_md['domain_length'])
+    if not np.array_equal(cut,npz['periodic_cut_origin']): raise RuntimeError(f'Periodic cut origin differs: {cut} (mesh metadata) vs {npz["periodic_cut_origin"]} (ownership npz)')
+    if not np.isclose(L,5/3,rtol=0,atol=1e-12): raise RuntimeError(f'Unexpected G60 domain length {L}')
+    cells_json=sorted(own['cells'],key=lambda x:int(x['cell_id']))
+    labels=np.array([int(x['acinus'][1:]) for x in cells_json]); seeds=np.array([x['seed_reference_model'] for x in cells_json])
+    if not (np.array_equal([int(x['cell_id']) for x in cells_json],npz['canonical_cell_id']) and np.array_equal(labels,npz['acinus_id']) and np.array_equal(seeds,npz['seed_reference'])):
+        raise RuntimeError('G60 ownership JSON and NPZ disagree (cell ids, acinus labels or seeds)')
     cells=[]
-    for x in own['cells']:
+    for x in cells_json:
         cells.append({'cell_id':x['cell_id'],'seed_coordinate':np.mod(np.asarray(x['seed_reference_model'])-cut,L).tolist(),'acinus_id':int(x['acinus'][1:])})
-    md={'periodic_cell':{'a1':[L,0.],'a2':[0.,L]},'cells':cells}
-    summary={'main_model':{'territories':[{'acinus_id':i,'area_fraction':.25} for i in range(4)]}}
+    md={'main_partition_method':G60_PARTITION_METHOD,'partition_source':{'ownership':base.repo_relative(OWNERSHIP),'assignment':own['assignment'],'coordinate_transform_for_mesh':own['coordinate_transform_for_mesh']},
+        'periodic_cell':{'bounds':[0.,0.,L,L],'a1':[L,0.],'a2':[0.,L]},'cells':cells}
+    area=npz['cell_area_model2']; centroids=np.mod(npz['centroid_reference']-cut,L)
+    territories=[{'acinus_id':i,'number_of_cells':int(np.sum(labels==i)),'area':float(area[labels==i].sum()),'area_fraction':float(area[labels==i].sum()/area.sum()),
+                  'shape':{'periodic_centroid':periodic_mean(centroids[labels==i],L).tolist(),'periodic_centroid_convention':'circular mean of translated canonical-cell centroids'}} for i in range(4)]
+    summary={'main_model':{'method':G60_PARTITION_METHOD,'area_source':base.repo_relative(OWNERSHIP_NPZ)+':cell_area_model2','territories':territories}}
     (RESULTS/'translated_acinar_metadata.json').write_text(json.dumps(md,indent=2)+'\n')
     (RESULTS/'acinar_summary_for_postprocessing.json').write_text(json.dumps(summary,indent=2)+'\n')
+    return RESULTS/'translated_acinar_metadata.json',RESULTS/'acinar_summary_for_postprocessing.json',(G60_PARTITION_METHOD,)
 
 def postprocess():
     import postprocess_regional_perfusion as regional
-    translated_ownership_files()
-    regional.run(RESULTS,RESULTS/'healthy_baseline_60x60.xdmf',RESULTS/'final_fields.vtu',RESULTS/'translated_acinar_metadata.json',RESULTS/'acinar_summary_for_postprocessing.json')
+    if GEOMETRY=='G60':
+        metadata,summary,methods=translated_ownership_files()
+    else:
+        entry=base.GEOMETRIES[GEOMETRY]; metadata,summary,methods=entry['acinar_metadata'],entry['acinar_summary'],('airway_constrained_space_filling',)
+    regional.run(RESULTS,Path(str(base.RESULT_BASE)+'.xdmf'),RESULTS/'final_fields.vtu',metadata,summary,accepted_partition_methods=methods)
+
+def unit_audit():
+    if GEOMETRY=='G60':
+        return {'coordinate_unit':'model length; 1 model unit = 8.4 mm','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','source_coefficient_unit':'Q_model per model-area in Theta*p_test*dx','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'interpretation':'dimensionless established baseline intrinsic-permeability coefficient','SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_mL_per_min':Q_TOTAL,'Q_total_m3_per_s':Q_TOTAL*1e-6/60,'model_convention':'Q_model=Q_physical/(1 mL/min), preserving the existing normalized weak-form scale','out_of_plane_depth':'not specified; no 3D-to-2D thickness inferred'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
+    return {'geometry':GEOMETRY,'purpose':'rehearsal of the G60 script code path on a registered small geometry; no physical calibration','coordinate_unit':'model length of the registered geometry; no physical length claimed','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_model':Q_TOTAL,'physical_unit':None,'model_convention':'established dimensionless loading of this geometry','out_of_plane_depth':'not specified'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
 
 def main(argv=None):
-    global RESULTS
+    global RESULTS,GEOMETRY,Q_TOTAL,FLOWS
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results-dir',type=Path,default=RESULTS.relative_to(ROOT),help='output directory (repository-relative)')
+    parser.add_argument('--geometry',choices=('G60','G20','G12'),default='G60',help='G60 (default) or a registered small geometry for an end-to-end rehearsal of this code path')
     base.add_solver_option_arguments(parser,foi_default='iterative')
     args=parser.parse_args(argv)
-    RESULTS=ROOT/args.results_dir
+    RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry
+    if GEOMETRY!='G60':
+        Q_TOTAL=REHEARSAL_Q_TOTAL; FLOWS={'Pa0':Q_TOTAL/4,'Pa1':Q_TOTAL/4,'Pa2':Q_TOTAL/4,'Pa3':Q_TOTAL/4,'V002':Q_TOTAL/2,'V006':Q_TOTAL/2}
     solver_options=base.solver_options_from_args(args,foi_default='iterative')
     # Files written by scripts/tools/start_run.sh and run_with_meta.py before this script starts.
     launcher_files={'STATUS','git_state.json','job.sh','job.pid','run.log','run_meta.json'}
     allowed_precreated={'solver.log','runtime.log'}|launcher_files
     if RESULTS.exists() and any(p.name not in allowed_precreated for p in RESULTS.iterdir()): raise RuntimeError(f'Refusing to overwrite populated result directory: {RESULTS}')
     RESULTS.mkdir(parents=True,exist_ok=True)
-    unit={'coordinate_unit':'model length; 1 model unit = 8.4 mm','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','source_coefficient_unit':'Q_model per model-area in Theta*p_test*dx','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'interpretation':'dimensionless established baseline intrinsic-permeability coefficient','SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_mL_per_min':Q_TOTAL,'Q_total_m3_per_s':Q_TOTAL*1e-6/60,'model_convention':'Q_model=Q_physical/(1 mL/min), preserving the existing normalized weak-form scale','out_of_plane_depth':'not specified; no 3D-to-2D thickness inferred'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
+    unit=unit_audit()
     (RESULTS/'unit_audit.json').write_text(json.dumps(unit,indent=2)+'\n')
-    base.GEOMETRY_LABEL='G60'; base.ACINAR_METADATA_JSON=OWNERSHIP  # ownership is not read by the driver here (global gas pressure); recorded for identification
-    base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULTS=RESULTS; base.RESULT_BASE=RESULTS/'healthy_baseline_60x60'; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.load_mesh_and_markers=load_60_mesh_and_markers; base.make_regional_gas_boundary_markers=global_gas_boundary_only
+    if GEOMETRY=='G60':
+        base.GEOMETRY_LABEL='G60'; base.ACINAR_METADATA_JSON=OWNERSHIP  # ownership is not read by the driver here (global gas pressure); recorded for identification
+        base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULT_BASE=RESULTS/'healthy_baseline_60x60'; base.load_mesh_and_markers=load_60_mesh_and_markers
+    else:
+        base.select_geometry(GEOMETRY); base.GEOMETRY_LABEL=GEOMETRY; base.RESULT_BASE=RESULTS/f'healthy_baseline_{GEOMETRY}'
+    base.RESULTS=RESULTS; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.make_regional_gas_boundary_markers=global_gas_boundary_only
     if solver_options is None:
         base.dmech.FOI.update_project=iterative_foi_projection
     else:
