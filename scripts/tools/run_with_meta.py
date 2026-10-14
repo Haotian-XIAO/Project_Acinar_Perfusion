@@ -35,6 +35,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ABORT_EXIT_CODE = 2
+THREAD_VARIABLES = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
 
 
 def now():
@@ -197,6 +199,9 @@ def run(args, target, run_dir):
             "platform_machine": platform.machine(),
             "rosetta_translated": rosetta_translated(errors),
             "pythonpath": redact(required_env("PYTHONPATH", errors)),
+            "cpu_count": os.cpu_count(),
+            # Unset means the library default applies; it is recorded as such, not as a failure.
+            "thread_variables": {name: os.environ.get(name, "unset") for name in THREAD_VARIABLES},
         },
         "geometry_manifest": os.path.relpath(args.manifest.resolve(), ROOT),
         "geometry_check": "requested" if args.geometry_file else "not requested",

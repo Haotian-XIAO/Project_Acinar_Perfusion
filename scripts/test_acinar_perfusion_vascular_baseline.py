@@ -82,6 +82,11 @@ SOLVER_PARAMETERS = {
     "linear_solver_name": "umfpack",
     "relax_type": "constant",
 }
+# Opt-in solver options (see scripts/solver_options.py). None keeps the tracked
+# solver path exactly: SOLVER_PARAMETERS, direct FOI projection, no wrappers.
+SOLVER_OPTIONS = None
+# Label recorded in run_config.json by scripts that set the geometry globals themselves.
+GEOMETRY_LABEL = None
 MACROSCOPIC_DISPLACEMENT_GRADIENT = ((0.0, 0.0), (0.0, 0.0))
 GAS_PRESSURE_MODE = "global"
 GLOBAL_GAS_PRESSURE = 0.0
@@ -474,18 +479,41 @@ def repo_relative(path):
 def geometry_inputs():
     """Geometry inputs actually in use, labelled with the matching registry key or 'custom'."""
     used = {"mesh_base": MESH_BASE, "marker_json": MARKER_JSON, "acinar_metadata": ACINAR_METADATA_JSON}
-    label = next(
-        (name for name, entry in GEOMETRIES.items() if all(entry[key] == value for key, value in used.items())),
-        "custom",
-    )
+    if GEOMETRY_LABEL is not None:
+        label = GEOMETRY_LABEL
+    else:
+        label = next(
+            (name for name, entry in GEOMETRIES.items() if all(entry[key] == value for key, value in used.items())),
+            "custom",
+        )
     return {"geometry": label, **{key: repo_relative(value) for key, value in used.items()}}
 
 
 def run():
+    if SOLVER_OPTIONS is None:
+        return _run(None)
+    import solver_options
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    solver_diag = solver_options.Diagnostics(RESULTS, SOLVER_OPTIONS)
+    solver_options.start_petsc_log()
+    with solver_options.FoiProjection(SOLVER_OPTIONS["foi_projection"], solver_diag):
+        _run(solver_diag)
+    solver_diag.mark("run_finished")
+    solver_options.write_petsc_log(RESULTS)
+
+
+def _mark(solver_diag, name):
+    if solver_diag is not None:
+        solver_diag.mark(name)
+
+
+def _run(solver_diag):
     RESULTS.mkdir(parents=True, exist_ok=True)
     geometry = geometry_inputs()
     print("Geometry inputs: " + json.dumps(geometry, indent=2))
     mesh, domains, marker_document = load_mesh_and_markers()
+    _mark(solver_diag, "mesh_loaded")
     dx, mass_report = assemble_patch_loading(mesh, domains, marker_document)
     boundaries, points, vertices, bbox = make_boundary_markers(mesh)
     regional_gas_boundaries, regional_gas_dS, gas_facet_report = (
@@ -520,6 +548,7 @@ def run():
         pore_behavior=material["pore"],
     )
 
+    _mark(solver_diag, "problem_created")
     permeability_space = dolfin.FunctionSpace(mesh, "DG", 0)
     permeability_scalar = dolfin.Function(permeability_space)
     permeability_scalar.vector()[:] = FLOW_PARAMETERS["k_wall"]
@@ -702,19 +731,29 @@ def run():
         "darcy_conductivity_operator_count": 1,
         "source_only_operator_count": len(source_operators),
     }
+    if SOLVER_OPTIONS is not None:
+        run_config["solver_options"] = SOLVER_OPTIONS
     (RESULTS / "run_config.json").write_text(json.dumps(run_config, indent=2))
 
+    linear_solver_type = SOLVER_PARAMETERS["linear_solver_type"]
+    linear_solver_name = SOLVER_PARAMETERS["linear_solver_name"]
+    if SOLVER_OPTIONS is not None:
+        linear_solver_type, linear_solver_name = LINEAR_SOLVER_BACKENDS[SOLVER_OPTIONS["linear_solver"]]
     solver = dmech.NonlinearSolver(
         problem=problem,
         parameters={
             "sol_tol": [1e-6] * len(problem.subsols),
             "n_iter_max": SOLVER_PARAMETERS["n_iter_max"],
-            "linear_solver_type": SOLVER_PARAMETERS["linear_solver_type"],
-            "linear_solver_name": SOLVER_PARAMETERS["linear_solver_name"],
+            "linear_solver_type": linear_solver_type,
+            "linear_solver_name": linear_solver_name,
         },
         relax_type=SOLVER_PARAMETERS["relax_type"],
         write_iter=0,
     )
+    if SOLVER_OPTIONS is not None:
+        import solver_options
+        solver_options.install(problem, solver, SOLVER_OPTIONS, solver_diag)
+        _mark(solver_diag, "solver_created")
     integrator = dmech.TimeIntegrator(
         problem=problem,
         solver=solver,
@@ -727,8 +766,10 @@ def run():
         write_vtus=0,
         write_vtus_with_preserved_connectivity=0,
     )
+    _mark(solver_diag, "integrator_created_initial_fois_projected")
     success = bool(integrator.integrate())
     integrator.close()
+    _mark(solver_diag, "integration_finished")
     if not success:
         raise RuntimeError("Healthy vascular baseline integration failed.")
 
@@ -807,6 +848,7 @@ def run():
     }
     (RESULTS / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
     write_final_vtu(mesh, domains, problem, darcy_operator)
+    _mark(solver_diag, "outputs_written")
 
     if abs(ptilde_mean) > 1e-8:
         raise RuntimeError(f"Pressure perturbation mean is not zero: {ptilde_mean}.")
@@ -816,9 +858,43 @@ def run():
     print(json.dumps({"diagnostics": diagnostics, "patch_pressures": pressure_report}, indent=2))
 
 
+LINEAR_SOLVER_BACKENDS = {
+    # name: (NonlinearSolver linear_solver_type, linear_solver_name)
+    "umfpack": ("dolfin", "umfpack"),
+    "mumps": ("petsc", "mumps"),
+}
+
+
+def add_solver_option_arguments(parser, foi_default="direct"):
+    """Solver options shared with run_60x60_full_healthy_baseline.py."""
+    parser.add_argument("--linear-solver", choices=sorted(LINEAR_SOLVER_BACKENDS), default="umfpack",
+                        help="Newton linear solver: umfpack (dolfin LUSolver, tracked default) or mumps (PETSc LU/MUMPS)")
+    parser.add_argument("--foi-projection", choices=("direct", "iterative"), default=foi_default,
+                        help="L2 projection of fields of interest: direct (dolfin.project default) or iterative (CG/Jacobi)")
+    parser.add_argument("--solver-diagnostics", action="store_true",
+                        help="enable the solver-options path even with default solver settings. Any non-default "
+                             "solver option enables it too: phase timings, peak RSS, residual history, MUMPS "
+                             "statistics, PETSc log, and abort (instead of retrying) on linear-solver errors")
+    parser.add_argument("--mumps-analysis-only", action="store_true",
+                        help="with --linear-solver mumps: run MUMPS analysis on the first Newton system, record "
+                             "its memory estimate in solver_diagnostics.json and exit without factorising")
+
+
+def solver_options_from_args(args, foi_default="direct"):
+    """None when no solver option differs from the calling script's defaults (its tracked code path)."""
+    if args.mumps_analysis_only and args.linear_solver != "mumps":
+        raise SystemExit("--mumps-analysis-only requires --linear-solver mumps")
+    if (args.linear_solver == "umfpack" and args.foi_projection == foi_default
+            and not args.solver_diagnostics and not args.mumps_analysis_only):
+        return None
+    return {"linear_solver": args.linear_solver, "linear_solver_backend": list(LINEAR_SOLVER_BACKENDS[args.linear_solver]),
+            "foi_projection": args.foi_projection, "solver_diagnostics_flag": bool(args.solver_diagnostics),
+            "mumps_analysis_only": bool(args.mumps_analysis_only)}
+
+
 def main(argv=None):
     """Command-line entry point; with no arguments it runs the accepted G12 case."""
-    global RESULTS, RESULT_BASE
+    global RESULTS, RESULT_BASE, SOLVER_OPTIONS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--geometry", choices=sorted(GEOMETRIES), default=DEFAULT_GEOMETRY,
                         help="registered geometry: selects mesh, marker JSON and acinar metadata together")
@@ -827,10 +903,12 @@ def main(argv=None):
     parser.add_argument("--acinar-metadata", type=Path, help="override: periodic_acinar_metadata.json (repository-relative)")
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS,
                         help="output directory (repository-relative)")
+    add_solver_option_arguments(parser)
     args = parser.parse_args(argv)
     if args.mesh is not None and args.acinar_metadata is None:
         parser.error("--mesh and --acinar-metadata must be given together")
     select_geometry(args.geometry, args.mesh, args.marker_json, args.acinar_metadata)
+    SOLVER_OPTIONS = solver_options_from_args(args)
     RESULTS = ROOT / args.results_dir
     RESULT_BASE = RESULTS / "vascular_baseline"
     run()

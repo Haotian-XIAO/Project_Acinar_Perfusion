@@ -10,7 +10,7 @@ mL/min), while its SI value is retained in metadata.  No out-of-plane depth,
 Pa conversion, or intrinsic k is invented here.
 """
 from __future__ import annotations
-import json, os, time
+import argparse, json, os, time
 from pathlib import Path
 import dolfin, meshio, numpy as np
 import test_acinar_perfusion_vascular_baseline as base
@@ -88,14 +88,27 @@ def postprocess():
     translated_ownership_files()
     regional.run(RESULTS,RESULTS/'healthy_baseline_60x60.xdmf',RESULTS/'final_fields.vtu',RESULTS/'translated_acinar_metadata.json',RESULTS/'acinar_summary_for_postprocessing.json')
 
-def main():
-    allowed_precreated={'solver.log','runtime.log'}
+def main(argv=None):
+    global RESULTS
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--results-dir',type=Path,default=RESULTS.relative_to(ROOT),help='output directory (repository-relative)')
+    base.add_solver_option_arguments(parser,foi_default='iterative')
+    args=parser.parse_args(argv)
+    RESULTS=ROOT/args.results_dir
+    solver_options=base.solver_options_from_args(args,foi_default='iterative')
+    # Files written by scripts/tools/start_run.sh and run_with_meta.py before this script starts.
+    launcher_files={'STATUS','git_state.json','job.sh','job.pid','run.log','run_meta.json'}
+    allowed_precreated={'solver.log','runtime.log'}|launcher_files
     if RESULTS.exists() and any(p.name not in allowed_precreated for p in RESULTS.iterdir()): raise RuntimeError(f'Refusing to overwrite populated result directory: {RESULTS}')
     RESULTS.mkdir(parents=True,exist_ok=True)
     unit={'coordinate_unit':'model length; 1 model unit = 8.4 mm','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','source_coefficient_unit':'Q_model per model-area in Theta*p_test*dx','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'interpretation':'dimensionless established baseline intrinsic-permeability coefficient','SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_mL_per_min':Q_TOTAL,'Q_total_m3_per_s':Q_TOTAL*1e-6/60,'model_convention':'Q_model=Q_physical/(1 mL/min), preserving the existing normalized weak-form scale','out_of_plane_depth':'not specified; no 3D-to-2D thickness inferred'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
     (RESULTS/'unit_audit.json').write_text(json.dumps(unit,indent=2)+'\n')
+    base.GEOMETRY_LABEL='G60'; base.ACINAR_METADATA_JSON=OWNERSHIP  # ownership is not read by the driver here (global gas pressure); recorded for identification
     base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULTS=RESULTS; base.RESULT_BASE=RESULTS/'healthy_baseline_60x60'; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.load_mesh_and_markers=load_60_mesh_and_markers; base.make_regional_gas_boundary_markers=global_gas_boundary_only
-    base.dmech.FOI.update_project=iterative_foi_projection
+    if solver_options is None:
+        base.dmech.FOI.update_project=iterative_foi_projection
+    else:
+        base.SOLVER_OPTIONS=solver_options  # FOI projection, linear solver and diagnostics handled by the driver
     global old_write; old_write=base.write_final_vtu; base.write_final_vtu=write_projected_metadata
     start=time.perf_counter(); base.run(); wall=time.perf_counter()-start
     cfg=json.loads((RESULTS/'run_config.json').read_text()); cfg['physical_loading']=unit['flow_mapping'];cfg['wall_time_seconds']=wall;cfg['macro_condition']='U_bar=0; F_bar=I; periodic local displacement fluctuations free';(RESULTS/'run_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
