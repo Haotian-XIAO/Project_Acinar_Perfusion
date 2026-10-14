@@ -188,6 +188,7 @@ def main(argv=None):
         base.MESH_BASE=MARKER_BASE; base.MARKER_JSON=SITES; base.RESULT_BASE=RESULTS/f'{case}_60x60'; base.load_mesh_and_markers=load_60_mesh_and_markers
     else:
         base.select_geometry(GEOMETRY); base.GEOMETRY_LABEL=GEOMETRY; base.RESULT_BASE=RESULTS/f'{case}_{GEOMETRY}'
+    base.LEGACY_PERIODIC_TOLERANCE=args.legacy_periodic_tolerance
     base.RESULTS=RESULTS; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.make_regional_gas_boundary_markers=global_gas_boundary_only
     if solver_options is None:
         base.dmech.FOI.update_project=iterative_foi_projection

@@ -18,6 +18,8 @@ import dolfin_mech as dmech
 import meshio
 import numpy as np
 
+import periodic_map
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,6 +89,9 @@ SOLVER_PARAMETERS = {
 SOLVER_OPTIONS = None
 # Label recorded in run_config.json by scripts that set the geometry globals themselves.
 GEOMETRY_LABEL = None
+# True reproduces dolfin_mech's default periodic map (tolerance 1e-3 x domain diagonal) and
+# 1e-3 pinpoint, which mis-pair periodic vertices (T006). Only for reproducing historical runs.
+LEGACY_PERIODIC_TOLERANCE = False
 MACROSCOPIC_DISPLACEMENT_GRADIENT = ((0.0, 0.0), (0.0, 0.0))
 GAS_PRESSURE_MODE = "global"
 GLOBAL_GAS_PRESSURE = 0.0
@@ -532,23 +537,29 @@ def _run(solver_diag):
         GAS_PRESSURE_MODE == "regional" or USE_REGIONAL_GAS_BOUNDARY_MEASURE_FOR_GLOBAL
     )
     active_boundaries = regional_gas_boundaries if use_regional_boundary_measure else boundaries
-    problem = dmech.MicroPoroFlowHyperelasticityProblem(
-        mesh=mesh,
-        vertices=vertices,
-        domains_mf=domains,
-        boundaries_mf=active_boundaries,
-        points_mf=points,
-        displacement_perturbation_degree=2,
-        quadrature_degree=6,
-        bcs="pbc",
-        porosity_init_val=POROSITY_PARAMETERS["val"],
-        flow_params=copy.deepcopy(FLOW_PARAMETERS),
-        skel_behavior=material["skel"],
-        bulk_behavior=material["bulk"],
-        pore_behavior=material["pore"],
-    )
+    with periodic_map.installed(mesh, legacy=LEGACY_PERIODIC_TOLERANCE) as periodic_method:
+        problem = dmech.MicroPoroFlowHyperelasticityProblem(
+            mesh=mesh,
+            vertices=vertices,
+            domains_mf=domains,
+            boundaries_mf=active_boundaries,
+            points_mf=points,
+            displacement_perturbation_degree=2,
+            quadrature_degree=6,
+            bcs="pbc",
+            porosity_init_val=POROSITY_PARAMETERS["val"],
+            flow_params=copy.deepcopy(FLOW_PARAMETERS),
+            skel_behavior=material["skel"],
+            bulk_behavior=material["bulk"],
+            pore_behavior=material["pore"],
+        )
 
     _mark(solver_diag, "problem_created")
+    # Raises unless every exact periodic vertex pair shares its dof, no other vertices are
+    # tied and the pinpoint fixes one vertex; the legacy map is only recorded.
+    periodic_verification = periodic_map.verify(problem, raise_on_error=not LEGACY_PERIODIC_TOLERANCE)
+    print("Periodic map: " + json.dumps({**periodic_method, "errors": periodic_verification["errors"]}))
+    _mark(solver_diag, "periodic_map_verified")
     permeability_space = dolfin.FunctionSpace(mesh, "DG", 0)
     permeability_scalar = dolfin.Function(permeability_space)
     permeability_scalar.vector()[:] = FLOW_PARAMETERS["k_wall"]
@@ -730,6 +741,7 @@ def _run(solver_diag):
         "solver_parameters": SOLVER_PARAMETERS,
         "darcy_conductivity_operator_count": 1,
         "source_only_operator_count": len(source_operators),
+        "periodic_map": {**periodic_method, "verification": periodic_verification},
     }
     if SOLVER_OPTIONS is not None:
         run_config["solver_options"] = SOLVER_OPTIONS
@@ -878,6 +890,9 @@ def add_solver_option_arguments(parser, foi_default="direct"):
     parser.add_argument("--mumps-analysis-only", action="store_true",
                         help="with --linear-solver mumps: run MUMPS analysis on the first Newton system, record "
                              "its memory estimate in solver_diagnostics.json and exit without factorising")
+    parser.add_argument("--legacy-periodic-tolerance", action="store_true",
+                        help="use dolfin_mech's default periodic map and pinpoint tolerances (defective, see "
+                             "scripts/periodic_map.py); only for reproducing historical runs")
 
 
 def solver_options_from_args(args, foi_default="direct"):
@@ -894,7 +909,7 @@ def solver_options_from_args(args, foi_default="direct"):
 
 def main(argv=None):
     """Command-line entry point; with no arguments it runs the accepted G12 case."""
-    global RESULTS, RESULT_BASE, SOLVER_OPTIONS
+    global RESULTS, RESULT_BASE, SOLVER_OPTIONS, LEGACY_PERIODIC_TOLERANCE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--geometry", choices=sorted(GEOMETRIES), default=DEFAULT_GEOMETRY,
                         help="registered geometry: selects mesh, marker JSON and acinar metadata together")
@@ -909,6 +924,7 @@ def main(argv=None):
         parser.error("--mesh and --acinar-metadata must be given together")
     select_geometry(args.geometry, args.mesh, args.marker_json, args.acinar_metadata)
     SOLVER_OPTIONS = solver_options_from_args(args)
+    LEGACY_PERIODIC_TOLERANCE = args.legacy_periodic_tolerance
     RESULTS = ROOT / args.results_dir
     RESULT_BASE = RESULTS / "vascular_baseline"
     run()
