@@ -19,6 +19,7 @@ import meshio
 import numpy as np
 
 import periodic_map
+import solution_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -784,6 +785,12 @@ def _run(solver_diag):
     _mark(solver_diag, "integration_finished")
     if not success:
         raise RuntimeError("Healthy vascular baseline integration failed.")
+    # Full-coefficient converged solution (reference fields for later reuse); read back and compared on write.
+    checkpoint = solution_checkpoint.write(
+        problem, Path(str(RESULT_BASE) + "_checkpoint.h5"), domains, periodic_method,
+        extra={"geometry_inputs": geometry, "t_step": 1.0, "written_after": "last converged increment"},
+    )
+    _mark(solver_diag, "checkpoint_written")
 
     problem.update_fois()
     total_area = float(dolfin.assemble(dolfin.Constant(1.0) * problem.dV))
@@ -857,6 +864,8 @@ def _run(solver_diag):
         "Q_l_magnitude_stats": Q_stats,
         "final_mass_balance_residual": mass_report["mass_balance_residual"],
         "periodic_pressure_continuity": periodic_continuity,
+        "checkpoint": {"h5_file": checkpoint["h5_file"], "mixed_space_dim": checkpoint["mixed_space_dim"],
+                       "readback_max_abs_difference": checkpoint["readback_max_abs_difference"]},
     }
     (RESULTS / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
     write_final_vtu(mesh, domains, problem, darcy_operator)
