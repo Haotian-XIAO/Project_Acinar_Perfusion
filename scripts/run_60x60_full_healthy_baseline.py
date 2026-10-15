@@ -17,6 +17,11 @@ rehearsals before a G60 run.  The default is G60.
 --alpha-pa2 A sets the Pa2 arterial suppression at unchanged total flow:
 Q_Pa2 = (A/4) Q_total, Q_Pa0 = Q_Pa1 = Q_Pa3 = (4 - A)/12 Q_total, venous
 sinks Q_total/2 each.  Without it the healthy equal split is used.
+
+--stretch LAMBDA prescribes an isotropic macroscopic stretch F_bar = LAMBDA I
+(U_bar = (LAMBDA - 1) I), ramped from 0 over the load increments by the
+existing macroscopic-stretch penalty operators.  --q-scale S multiplies
+Q_total and every source/sink flow by S.  Without them nothing changes.
 """
 from __future__ import annotations
 import argparse, json, os, time
@@ -43,6 +48,8 @@ FLOWS={'Pa0':Q_TOTAL/4,'Pa1':Q_TOTAL/4,'Pa2':Q_TOTAL/4,'Pa3':Q_TOTAL/4,'V002':Q_
 REHEARSAL_Q_TOTAL=1.0
 GEOMETRY='G60'
 ALPHA_PA2=None
+STRETCH=None
+Q_SCALE=1.0
 
 def healthy_flows(q_total):
     return {'Pa0':q_total/4,'Pa1':q_total/4,'Pa2':q_total/4,'Pa3':q_total/4,'V002':q_total/2,'V006':q_total/2}
@@ -158,19 +165,29 @@ def unit_audit():
     return {'geometry':GEOMETRY,'purpose':'rehearsal of the G60 script code path on a registered small geometry; no physical calibration','coordinate_unit':'model length of the registered geometry; no physical length claimed','pressure_unit':'undocumented code pressure unit; no Pa/mmHg conversion verified','darcy_coefficient':{'symbol':'k_wall / k_l0','value':1.0,'SI_intrinsic_permeability_claimed':False},'flow_mapping':{'Q_total_model':Q_TOTAL,'physical_unit':None,'model_convention':'established dimensionless loading of this geometry','out_of_plane_depth':'not specified'},'gas_pressure':{'value':0.0,'unit':'code pressure unit','provenance':'existing healthy baseline GLOBAL_GAS_PRESSURE'}}
 
 def main(argv=None):
-    global RESULTS,GEOMETRY,Q_TOTAL,FLOWS,ALPHA_PA2
+    global RESULTS,GEOMETRY,Q_TOTAL,FLOWS,ALPHA_PA2,STRETCH,Q_SCALE
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results-dir',type=Path,default=RESULTS.relative_to(ROOT),help='output directory (repository-relative)')
     parser.add_argument('--geometry',choices=('G60','G20','G12'),default='G60',help='G60 (default) or a registered small geometry for an end-to-end rehearsal of this code path')
     parser.add_argument('--alpha-pa2',type=float,default=None,help='Pa2 arterial suppression alpha in [0, 1] at fixed Q_total (default: healthy equal split)')
+    parser.add_argument('--stretch',type=float,default=None,help='isotropic macroscopic stretch lambda: F_bar = lambda I, ramped over the load increments (default: U_bar = 0)')
+    parser.add_argument('--q-scale',type=float,default=1.0,help='multiply Q_total and every source/sink flow by this factor (default 1)')
     base.add_solver_option_arguments(parser,foi_default='iterative')
     args=parser.parse_args(argv)
-    RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry; ALPHA_PA2=args.alpha_pa2
+    RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry; ALPHA_PA2=args.alpha_pa2; STRETCH=args.stretch; Q_SCALE=args.q_scale
+    if STRETCH is not None and not (np.isfinite(STRETCH) and STRETCH>0): raise ValueError(f'--stretch must be a positive number, got {STRETCH}')
+    if not (np.isfinite(Q_SCALE) and Q_SCALE>0): raise ValueError(f'--q-scale must be a positive number, got {Q_SCALE}')
     if GEOMETRY!='G60':
         Q_TOTAL=REHEARSAL_Q_TOTAL; FLOWS=healthy_flows(Q_TOTAL)
+    Q_TOTAL_UNSCALED=Q_TOTAL
+    if Q_SCALE!=1.0:
+        Q_TOTAL=Q_TOTAL*Q_SCALE; FLOWS=healthy_flows(Q_TOTAL)
     if ALPHA_PA2 is not None:
         FLOWS=alpha_flows(Q_TOTAL,ALPHA_PA2)
     case='healthy_baseline' if ALPHA_PA2 is None else f'alpha_Pa2_{ALPHA_PA2:g}'
+    if STRETCH is not None: case+=f'_stretch_{STRETCH:g}'
+    if Q_SCALE!=1.0: case+=f'_qscale_{Q_SCALE:g}'
+    macro_gradient=((0.,0.),(0.,0.)) if STRETCH is None else ((STRETCH-1.,0.),(0.,STRETCH-1.))
     solver_options=base.solver_options_from_args(args,foi_default='iterative')
     # Files written by scripts/tools/start_run.sh and run_with_meta.py before this script starts.
     launcher_files={'STATUS','git_state.json','job.sh','job.pid','run.log','run_meta.json'}
@@ -178,10 +195,15 @@ def main(argv=None):
     if RESULTS.exists() and any(p.name not in allowed_precreated for p in RESULTS.iterdir()): raise RuntimeError(f'Refusing to overwrite populated result directory: {RESULTS}')
     RESULTS.mkdir(parents=True,exist_ok=True)
     unit=unit_audit()
+    if Q_SCALE!=1.0: unit['flow_mapping']={**unit['flow_mapping'],'q_scale':Q_SCALE,'Q_total_before_q_scale':Q_TOTAL_UNSCALED,'note':'Q_total and flows above already include q_scale'}
     (RESULTS/'unit_audit.json').write_text(json.dumps(unit,indent=2)+'\n')
-    if ALPHA_PA2 is not None:
+    experiment=None
+    if ALPHA_PA2 is not None or STRETCH is not None or Q_SCALE!=1.0:
         # Written before the solve so that an aborted run still records its loading case.
-        experiment={'suppressed_arterial_source':'Pa2','alpha_Pa2':ALPHA_PA2,'Q_total':Q_TOTAL,'target_flows':FLOWS,'definition':'Q_Pa2=(alpha/4) Q_total; Q_Pa0=Q_Pa1=Q_Pa3=(4-alpha)/12 Q_total; venous sinks Q_total/2 each'}
+        experiment={'Q_total':Q_TOTAL,'target_flows':FLOWS}
+        if ALPHA_PA2 is not None: experiment.update({'suppressed_arterial_source':'Pa2','alpha_Pa2':ALPHA_PA2,'definition':'Q_Pa2=(alpha/4) Q_total; Q_Pa0=Q_Pa1=Q_Pa3=(4-alpha)/12 Q_total; venous sinks Q_total/2 each'})
+        if STRETCH is not None: experiment.update({'isotropic_stretch':STRETCH,'F_bar':[[STRETCH,0.],[0.,STRETCH]],'U_bar_prescribed':[list(r) for r in macro_gradient],'stretch_application':'penalty targets U_bar_ij ramped linearly from 0 over the load increments (add_macroscopic_stretch_component_penalty_operator, pen_val 1e6)'})
+        if Q_SCALE!=1.0: experiment.update({'q_scale':Q_SCALE,'Q_total_before_q_scale':Q_TOTAL_UNSCALED})
         (RESULTS/'case_definition.json').write_text(json.dumps(experiment,indent=2)+'\n')
     if GEOMETRY=='G60':
         base.GEOMETRY_LABEL='G60'; base.ACINAR_METADATA_JSON=OWNERSHIP  # ownership is not read by the driver here (global gas pressure); recorded for identification
@@ -189,15 +211,15 @@ def main(argv=None):
     else:
         base.select_geometry(GEOMETRY); base.GEOMETRY_LABEL=GEOMETRY; base.RESULT_BASE=RESULTS/f'{case}_{GEOMETRY}'
     base.LEGACY_PERIODIC_TOLERANCE=args.legacy_periodic_tolerance
-    base.RESULTS=RESULTS; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=((0.,0.),(0.,0.)); base.make_regional_gas_boundary_markers=global_gas_boundary_only
+    base.RESULTS=RESULTS; base.Q_TOTAL=Q_TOTAL; base.TARGET_FLOWS=dict(FLOWS); base.MACROSCOPIC_DISPLACEMENT_GRADIENT=macro_gradient; base.make_regional_gas_boundary_markers=global_gas_boundary_only
     if solver_options is None:
         base.dmech.FOI.update_project=iterative_foi_projection
     else:
         base.SOLVER_OPTIONS=solver_options  # FOI projection, linear solver and diagnostics handled by the driver
     global old_write; old_write=base.write_final_vtu; base.write_final_vtu=write_projected_metadata
     start=time.perf_counter(); base.run(); wall=time.perf_counter()-start
-    cfg=json.loads((RESULTS/'run_config.json').read_text()); cfg['physical_loading']=unit['flow_mapping'];cfg['wall_time_seconds']=wall;cfg['macro_condition']='U_bar=0; F_bar=I; periodic local displacement fluctuations free'
-    if ALPHA_PA2 is not None: cfg['experiment']=experiment
+    cfg=json.loads((RESULTS/'run_config.json').read_text()); cfg['physical_loading']=unit['flow_mapping'];cfg['wall_time_seconds']=wall;cfg['macro_condition']=('U_bar=0; F_bar=I' if STRETCH is None else f'U_bar=({STRETCH:g}-1) I; F_bar={STRETCH:g} I')+'; periodic local displacement fluctuations free'
+    if experiment is not None: cfg['experiment']=experiment
     (RESULTS/'run_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
     postprocess()
     print(json.dumps({'status':'complete','wall_time_seconds':wall,'results':str(RESULTS)},indent=2))
