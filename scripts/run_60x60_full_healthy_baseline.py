@@ -22,6 +22,12 @@ sinks Q_total/2 each.  Without it the healthy equal split is used.
 (U_bar = (LAMBDA - 1) I), ramped from 0 over the load increments by the
 existing macroscopic-stretch penalty operators.  --q-scale S multiplies
 Q_total and every source/sink flow by S.  Without them nothing changes.
+
+--gas-pressure PG sets the global gas pressure (ramped like the driver's
+GLOBAL_GAS_PRESSURE).  --vascular-coupling pressure drives the supports by
+reservoir pressures through feeding conductances (scripts/pressure_coupling.py;
+flows become outputs, so --alpha-pa2 and --q-scale are refused).  Without them
+nothing changes.
 """
 from __future__ import annotations
 import argparse, json, os, time
@@ -90,7 +96,7 @@ def global_gas_boundary_only(mesh,boundaries):
     # Global p_g=0 uses the original exterior measure; regional gas tagging is
     # irrelevant to this loading and is intentionally not reconstructed.
     return boundaries,dolfin.Measure('exterior_facet',domain=mesh,subdomain_data=boundaries),{
-        'status':'not_needed_for_global_zero_gas_pressure','global_gas_pressure':0.0}
+        'status':'not_needed_for_global_zero_gas_pressure' if base.GAS_PRESSURE_SOURCE is None else 'not_needed_for_global_gas_pressure','global_gas_pressure':float(base.GLOBAL_GAS_PRESSURE)}
 
 def macroscopic_displacement_gradient(problem,dV,area):
     """Converged U_bar, evaluated from the mixed solution.
@@ -158,6 +164,9 @@ def postprocess():
     else:
         entry=base.GEOMETRIES[GEOMETRY]; metadata,summary,methods=entry['acinar_metadata'],entry['acinar_summary'],('airway_constrained_space_filling',)
     regional.run(RESULTS,Path(str(base.RESULT_BASE)+'.xdmf'),RESULTS/'final_fields.vtu',metadata,summary,accepted_partition_methods=methods)
+    if base.VASCULAR_COUPLING is not None:
+        import pressure_coupling
+        pressure_coupling.add_acinus_exchange(RESULTS)  # per-acinus split of the support exchange (needs fe_acinar_mapping.json)
 
 def unit_audit():
     if GEOMETRY=='G60':
@@ -173,7 +182,14 @@ def main(argv=None):
     parser.add_argument('--stretch',type=float,default=None,help='isotropic macroscopic stretch lambda: F_bar = lambda I, ramped over the load increments (default: U_bar = 0)')
     parser.add_argument('--q-scale',type=float,default=1.0,help='multiply Q_total and every source/sink flow by this factor (default 1)')
     base.add_solver_option_arguments(parser,foi_default='iterative')
+    base.add_vascular_coupling_arguments(parser)
     args=parser.parse_args(argv)
+    if args.vascular_coupling=='pressure':
+        # flows are outputs on the pressure path
+        if args.alpha_pa2 is not None: parser.error('--alpha-pa2 prescribes flows; not available with --vascular-coupling pressure')
+        if args.q_scale!=1.0: parser.error('--q-scale scales prescribed flows; not available with --vascular-coupling pressure')
+    base.apply_vascular_coupling_args(args,parser)
+    PRESSURE=base.VASCULAR_COUPLING is not None
     RESULTS=ROOT/args.results_dir; GEOMETRY=args.geometry; ALPHA_PA2=args.alpha_pa2; STRETCH=args.stretch; Q_SCALE=args.q_scale
     if STRETCH is not None and not (np.isfinite(STRETCH) and STRETCH>0): raise ValueError(f'--stretch must be a positive number, got {STRETCH}')
     if not (np.isfinite(Q_SCALE) and Q_SCALE>0): raise ValueError(f'--q-scale must be a positive number, got {Q_SCALE}')
@@ -187,6 +203,8 @@ def main(argv=None):
     case='healthy_baseline' if ALPHA_PA2 is None else f'alpha_Pa2_{ALPHA_PA2:g}'
     if STRETCH is not None: case+=f'_stretch_{STRETCH:g}'
     if Q_SCALE!=1.0: case+=f'_qscale_{Q_SCALE:g}'
+    if base.GAS_PRESSURE_SOURCE is not None: case+=f'_pg_{base.GLOBAL_GAS_PRESSURE:g}'
+    if PRESSURE: case+=f"_pressure_{base.VASCULAR_COUPLING['config']}"
     macro_gradient=((0.,0.),(0.,0.)) if STRETCH is None else ((STRETCH-1.,0.),(0.,STRETCH-1.))
     solver_options=base.solver_options_from_args(args,foi_default='iterative')
     # Files written by scripts/tools/start_run.sh and run_with_meta.py before this script starts.
@@ -196,11 +214,13 @@ def main(argv=None):
     RESULTS.mkdir(parents=True,exist_ok=True)
     unit=unit_audit()
     if Q_SCALE!=1.0: unit['flow_mapping']={**unit['flow_mapping'],'q_scale':Q_SCALE,'Q_total_before_q_scale':Q_TOTAL_UNSCALED,'note':'Q_total and flows above already include q_scale'}
+    if base.GAS_PRESSURE_SOURCE is not None: unit['gas_pressure']={**unit['gas_pressure'],'value':float(base.GLOBAL_GAS_PRESSURE),'provenance':'--gas-pressure (GLOBAL_GAS_PRESSURE, ramped from 0 over the load increments)'}
+    if PRESSURE: unit['flow_mapping']={'vascular_coupling':'pressure','flows':'outputs (vascular_exchange.json); Q_total above is not imposed','prescribed_flow_mapping_not_used':unit['flow_mapping']}
     (RESULTS/'unit_audit.json').write_text(json.dumps(unit,indent=2)+'\n')
     experiment=None
     if ALPHA_PA2 is not None or STRETCH is not None or Q_SCALE!=1.0:
         # Written before the solve so that an aborted run still records its loading case.
-        experiment={'Q_total':Q_TOTAL,'target_flows':FLOWS}
+        experiment={'flows':'outputs on the pressure path (vascular_exchange.json)'} if PRESSURE else {'Q_total':Q_TOTAL,'target_flows':FLOWS}
         if ALPHA_PA2 is not None: experiment.update({'suppressed_arterial_source':'Pa2','alpha_Pa2':ALPHA_PA2,'definition':'Q_Pa2=(alpha/4) Q_total; Q_Pa0=Q_Pa1=Q_Pa3=(4-alpha)/12 Q_total; venous sinks Q_total/2 each'})
         if STRETCH is not None: experiment.update({'isotropic_stretch':STRETCH,'F_bar':[[STRETCH,0.],[0.,STRETCH]],'U_bar_prescribed':[list(r) for r in macro_gradient],'stretch_application':'penalty targets U_bar_ij ramped linearly from 0 over the load increments (add_macroscopic_stretch_component_penalty_operator, pen_val 1e6)'})
         if Q_SCALE!=1.0: experiment.update({'q_scale':Q_SCALE,'Q_total_before_q_scale':Q_TOTAL_UNSCALED})

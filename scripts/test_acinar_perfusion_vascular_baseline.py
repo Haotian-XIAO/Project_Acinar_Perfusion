@@ -3,6 +3,10 @@
 
 The implementation deliberately keeps one ``DarcyFlowOperator`` and adds six
 project-local source-only residual operators.  It does not modify dolfin_mech.
+
+Opt-in: ``--vascular-coupling pressure`` replaces the prescribed support flows by
+Robin exchange with reservoir pressures (scripts/pressure_coupling.py), and
+``--gas-pressure`` sets GLOBAL_GAS_PRESSURE.  Without them nothing changes.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 from pathlib import Path
 
@@ -19,6 +24,7 @@ import meshio
 import numpy as np
 
 import periodic_map
+import pressure_coupling
 import solution_checkpoint
 
 
@@ -96,6 +102,10 @@ LEGACY_PERIODIC_TOLERANCE = False
 MACROSCOPIC_DISPLACEMENT_GRADIENT = ((0.0, 0.0), (0.0, 0.0))
 GAS_PRESSURE_MODE = "global"
 GLOBAL_GAS_PRESSURE = 0.0
+# Set to "--gas-pressure" when GLOBAL_GAS_PRESSURE comes from the command line (recorded); None leaves outputs unchanged.
+GAS_PRESSURE_SOURCE = None
+# Opt-in pressure-driven vascular coupling request (scripts/pressure_coupling.py); None = prescribed flows.
+VASCULAR_COUPLING = None
 REGIONAL_GAS_PRESSURES = (0.0, 0.0, 0.0, 0.0)
 REGIONAL_GAS_TAGS = {0: 10, 1: 11, 2: 12, 3: 13}
 GAS_FACET_TIE_TOLERANCE = 1e-12
@@ -349,6 +359,39 @@ def assemble_patch_loading(mesh, domains, marker_document):
     return dx, report
 
 
+def assemble_support_areas(mesh, domains, marker_document):
+    """Pressure path: assembled reference support areas only (no prescribed flows, no mass_balance.json)."""
+    dx = dolfin.Measure("dx", domain=mesh, subdomain_data=domains)
+    rows = {}
+    for vascular_id, marker in marker_document["markers"].items():
+        tag = int(marker["physical_tag"])
+        area = float(dolfin.assemble(dolfin.Constant(1.0) * dx(tag)))
+        if area <= 0.0:
+            raise RuntimeError(f"Vascular marker {vascular_id} has zero assembled area.")
+        rows[vascular_id] = {"physical_tag": tag, "vascular_type": marker["vascular_type"], "assembled_reference_area": area}
+    return dx, {"patches": rows}
+
+
+GAS_PRESSURE_APPLICATION = ("GLOBAL_GAS_PRESSURE: SurfacePressureLoadingOperator on the gas boundary, "
+                            "ramped linearly from 0 over the load increments")
+
+
+def record_case_definition(exchange):
+    """Merge the gas-pressure and vascular-coupling records into case_definition.json (before the build)."""
+    entries = {}
+    if GAS_PRESSURE_SOURCE is not None:
+        entries["gas_pressure"] = {"global_gas_pressure": float(GLOBAL_GAS_PRESSURE), "source": GAS_PRESSURE_SOURCE,
+                                   "application": GAS_PRESSURE_APPLICATION}
+    if exchange is not None:
+        entries["vascular_coupling"] = exchange
+    if not entries:
+        return
+    path = RESULTS / "case_definition.json"
+    document = json.loads(path.read_text()) if path.exists() else {}
+    document.update(entries)
+    path.write_text(json.dumps(document, indent=2) + "\n")
+
+
 def scalar_cell_values(function, mesh):
     values = np.empty(mesh.num_cells(), dtype=float)
     local = function.vector().get_local()
@@ -518,9 +561,20 @@ def _run(solver_diag):
     RESULTS.mkdir(parents=True, exist_ok=True)
     geometry = geometry_inputs()
     print("Geometry inputs: " + json.dumps(geometry, indent=2))
+    reference = None
+    if VASCULAR_COUPLING is not None:
+        reference = pressure_coupling.load_reference(
+            VASCULAR_COUPLING, ROOT, geometry, LEGACY_PERIODIC_TOLERANCE,
+            MACROSCOPIC_DISPLACEMENT_GRADIENT, GLOBAL_GAS_PRESSURE)
     mesh, domains, marker_document = load_mesh_and_markers()
     _mark(solver_diag, "mesh_loaded")
-    dx, mass_report = assemble_patch_loading(mesh, domains, marker_document)
+    if VASCULAR_COUPLING is None:
+        dx, mass_report = assemble_patch_loading(mesh, domains, marker_document)
+        exchange = None
+    else:
+        dx, mass_report = assemble_support_areas(mesh, domains, marker_document)
+        exchange = pressure_coupling.resolve(VASCULAR_COUPLING, reference, mass_report["patches"], GLOBAL_GAS_PRESSURE)
+    record_case_definition(exchange)
     boundaries, points, vertices, bbox = make_boundary_markers(mesh)
     regional_gas_boundaries, regional_gas_dS, gas_facet_report = (
         make_regional_gas_boundary_markers(mesh, boundaries)
@@ -539,7 +593,11 @@ def _run(solver_diag):
     )
     active_boundaries = regional_gas_boundaries if use_regional_boundary_measure else boundaries
     with periodic_map.installed(mesh, legacy=LEGACY_PERIODIC_TOLERANCE) as periodic_method:
-        problem = dmech.MicroPoroFlowHyperelasticityProblem(
+        problem_class = dmech.MicroPoroFlowHyperelasticityProblem
+        if exchange is not None:
+            # zero-mean gauge replaced by a pin of its multiplier; the Robin terms fix the pressure level
+            problem_class = pressure_coupling.lambda_pinned_problem_class(problem_class)
+        problem = problem_class(
             mesh=mesh,
             vertices=vertices,
             domains_mf=domains,
@@ -669,18 +727,22 @@ def _run(solver_diag):
         k_step=step_index,
     )
     source_operators = []
-    for vascular_id, row in mass_report["patches"].items():
-        sign = -1.0 if row["vascular_type"] == "arterial" else 1.0
-        source_operators.append(problem.add_operator(
-            VascularSourceOnlyOperator(
-                p_test=problem.pl_perturbation_subsol.dsubtest,
-                measure=problem.get_subdomain_measure(row["physical_tag"]),
-                theta_ini=0.0,
-                theta_fin=row["Theta"],
-                residual_sign=sign,
-            ),
-            k_step=step_index,
-        ))
+    exchange_operators = []
+    if exchange is None:
+        for vascular_id, row in mass_report["patches"].items():
+            sign = -1.0 if row["vascular_type"] == "arterial" else 1.0
+            source_operators.append(problem.add_operator(
+                VascularSourceOnlyOperator(
+                    p_test=problem.pl_perturbation_subsol.dsubtest,
+                    measure=problem.get_subdomain_measure(row["physical_tag"]),
+                    theta_ini=0.0,
+                    theta_fin=row["Theta"],
+                    residual_sign=sign,
+                ),
+                k_step=step_index,
+            ))
+    else:
+        exchange_operators = pressure_coupling.add_exchange_operators(problem, darcy_operator, exchange, step_index)
     if sum(hasattr(op, "K_l") for op in problem.steps[step_index].operators) != 1:
         raise RuntimeError("Expected exactly one global Darcy conductivity operator.")
 
@@ -716,7 +778,7 @@ def _run(solver_diag):
         "marker_map": marker_document,
         "Q_total": Q_TOTAL,
         "target_flows": TARGET_FLOWS,
-        "Theta": {key: row["Theta"] for key, row in mass_report["patches"].items()},
+        "Theta": ({key: row["Theta"] for key, row in mass_report["patches"].items()} if exchange is None else None),
         "pbar_l": 0.0,
         "macro_pressure_gradient": [0.0, 0.0],
         "macroscopic_displacement_gradient": MACROSCOPIC_DISPLACEMENT_GRADIENT,
@@ -746,6 +808,12 @@ def _run(solver_diag):
     }
     if SOLVER_OPTIONS is not None:
         run_config["solver_options"] = SOLVER_OPTIONS
+    if exchange is not None:
+        run_config.update({"Q_total": None, "target_flows": None, "Theta": None,
+                           "source_only_operator_count": 0, "exchange_operator_count": len(exchange_operators),
+                           "vascular_coupling": exchange})
+    if GAS_PRESSURE_SOURCE is not None:
+        run_config["gas_pressure_source"] = {"source": GAS_PRESSURE_SOURCE, "application": GAS_PRESSURE_APPLICATION}
     (RESULTS / "run_config.json").write_text(json.dumps(run_config, indent=2))
 
     linear_solver_type = SOLVER_PARAMETERS["linear_solver_type"]
@@ -788,7 +856,8 @@ def _run(solver_diag):
     # Full-coefficient converged solution (reference fields for later reuse); read back and compared on write.
     checkpoint = solution_checkpoint.write(
         problem, Path(str(RESULT_BASE) + "_checkpoint.h5"), domains, periodic_method,
-        extra={"geometry_inputs": geometry, "t_step": 1.0, "written_after": "last converged increment"},
+        extra={"geometry_inputs": geometry, "t_step": 1.0, "written_after": "last converged increment",
+               **({} if exchange is None else {"vascular_coupling": {"mode": "pressure", "config": exchange["config"]}})},
     )
     _mark(solver_diag, "checkpoint_written")
 
@@ -828,18 +897,41 @@ def _run(solver_diag):
             / row["assembled_reference_area"]
         )
         patch_pressures[vascular_id] = patch_pressure
-    pa_eff = sum(TARGET_FLOWS[key] * patch_pressures[key] for key in TARGET_FLOWS if key.startswith("Pa")) / Q_TOTAL
-    pv_eff = sum(TARGET_FLOWS[key] * patch_pressures[key] for key in TARGET_FLOWS if key.startswith("V")) / Q_TOTAL
-    delta_p = pa_eff - pv_eff
-    hydraulic_resistance = delta_p / Q_TOTAL
-    pressure_report = {
-        "patch_area_averaged_pressure": patch_pressures,
-        "pa_eff": pa_eff,
-        "pv_eff": pv_eff,
-        "Delta_p_av": delta_p,
-        "R_hyd": hydraulic_resistance,
-        "Q_total": Q_TOTAL,
-    }
+    if exchange is None:
+        pa_eff = sum(TARGET_FLOWS[key] * patch_pressures[key] for key in TARGET_FLOWS if key.startswith("Pa")) / Q_TOTAL
+        pv_eff = sum(TARGET_FLOWS[key] * patch_pressures[key] for key in TARGET_FLOWS if key.startswith("V")) / Q_TOTAL
+        delta_p = pa_eff - pv_eff
+        hydraulic_resistance = delta_p / Q_TOTAL
+        pressure_report = {
+            "patch_area_averaged_pressure": patch_pressures,
+            "pa_eff": pa_eff,
+            "pv_eff": pv_eff,
+            "Delta_p_av": delta_p,
+            "R_hyd": hydraulic_resistance,
+            "Q_total": Q_TOTAL,
+        }
+    else:
+        exchange_result = pressure_coupling.exchange_report(problem, darcy_operator, exchange_operators, exchange)
+        flows = {key: value["Q_k"] for key, value in exchange_result["supports"].items()}
+        arterial = [key for key in flows if mass_report["patches"][key]["vascular_type"] == "arterial"]
+        venous = [key for key in flows if mass_report["patches"][key]["vascular_type"] == "venous"]
+        q_a, q_v = exchange_result["Q_a_tot"], -exchange_result["Q_v_tot"]
+        pa_eff = sum(flows[key] * patch_pressures[key] for key in arterial) / q_a
+        pv_eff = sum(-flows[key] * patch_pressures[key] for key in venous) / q_v
+        delta_p = pa_eff - pv_eff
+        hydraulic_resistance = delta_p / q_a
+        pressure_report = {
+            "patch_area_averaged_pressure": patch_pressures,
+            "pa_eff": pa_eff,
+            "pv_eff": pv_eff,
+            "Delta_p_av": delta_p,
+            "R_hyd": hydraulic_resistance,
+            "Q_total": q_a,
+            "mode": "pressure",
+            "convention": "pa_eff/pv_eff weighted by the computed exchange flows |Q_k|; Q_total = Q_a^tot (computed)",
+        }
+        (RESULTS / "vascular_exchange.json").write_text(json.dumps(exchange_result, indent=2) + "\n")
+        np.savez_compressed(RESULTS / "vascular_exchange_cells.npz", **pressure_coupling.cell_exchange(mesh, exchange_operators))
     (RESULTS / "patch_pressures.json").write_text(json.dumps(pressure_report, indent=2))
 
     increments = parse_increment_table(RESULTS / "increments.sta")
@@ -862,19 +954,30 @@ def _run(solver_diag):
         "pressure_stats": pressure_stats,
         "q_l_magnitude_stats": q_stats,
         "Q_l_magnitude_stats": Q_stats,
-        "final_mass_balance_residual": mass_report["mass_balance_residual"],
+        "final_mass_balance_residual": (mass_report["mass_balance_residual"] if exchange is None
+                                        else exchange_result["sum_Q_k"]),
         "periodic_pressure_continuity": periodic_continuity,
         "checkpoint": {"h5_file": checkpoint["h5_file"], "mixed_space_dim": checkpoint["mixed_space_dim"],
                        "readback_max_abs_difference": checkpoint["readback_max_abs_difference"]},
     }
+    if exchange is not None:
+        diagnostics["vascular_coupling_mode"] = "pressure"
+        diagnostics["final_mass_balance_residual_definition"] = "sum_k Q_k (computed exchange flows)"
     (RESULTS / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
     write_final_vtu(mesh, domains, problem, darcy_operator)
     _mark(solver_diag, "outputs_written")
 
-    if abs(ptilde_mean) > 1e-8:
-        raise RuntimeError(f"Pressure perturbation mean is not zero: {ptilde_mean}.")
-    if abs(lambda_p) > 1e-8:
-        raise RuntimeError(f"Pressure zero-mean multiplier is materially nonzero: {lambda_p}.")
+    if exchange is None:
+        if abs(ptilde_mean) > 1e-8:
+            raise RuntimeError(f"Pressure perturbation mean is not zero: {ptilde_mean}.")
+        if abs(lambda_p) > 1e-8:
+            raise RuntimeError(f"Pressure zero-mean multiplier is materially nonzero: {lambda_p}.")
+    else:
+        if exchange_result["lambda_dof_max_abs"] != 0.0:
+            raise RuntimeError(f"Pinned multiplier is not exactly zero: {exchange_result['lambda_dof_max_abs']}.")
+        relative = exchange_result["sum_Q_k_relative_to_Q_a_tot"]
+        if relative is None or not abs(relative) <= pressure_coupling.CONSERVATION_TOLERANCE:
+            raise RuntimeError(f"Exchange flows not conserved: sum_k Q_k / Q_a^tot = {relative}.")
 
     print(json.dumps({"diagnostics": diagnostics, "patch_pressures": pressure_report}, indent=2))
 
@@ -904,6 +1007,24 @@ def add_solver_option_arguments(parser, foi_default="direct"):
                              "scripts/periodic_map.py); only for reproducing historical runs")
 
 
+def add_vascular_coupling_arguments(parser):
+    """Loading options shared with run_60x60_full_healthy_baseline.py: gas pressure and vascular coupling."""
+    parser.add_argument("--gas-pressure", type=float, default=None,
+                        help="global gas pressure p_g (ramped like GLOBAL_GAS_PRESSURE; default: unchanged, 0)")
+    pressure_coupling.add_arguments(parser)
+
+
+def apply_vascular_coupling_args(args, parser):
+    """Set GLOBAL_GAS_PRESSURE and VASCULAR_COUPLING from the command line; nothing changes when the flags are absent."""
+    global GLOBAL_GAS_PRESSURE, GAS_PRESSURE_SOURCE, VASCULAR_COUPLING
+    if args.gas_pressure is not None:
+        if not math.isfinite(args.gas_pressure):
+            parser.error(f"--gas-pressure must be finite, got {args.gas_pressure}")
+        GLOBAL_GAS_PRESSURE = float(args.gas_pressure)
+        GAS_PRESSURE_SOURCE = "--gas-pressure"
+    VASCULAR_COUPLING = pressure_coupling.spec_from_args(args, parser)
+
+
 def solver_options_from_args(args, foi_default="direct"):
     """None when no solver option differs from the calling script's defaults (its tracked code path)."""
     if args.mumps_analysis_only and args.linear_solver != "mumps":
@@ -928,9 +1049,11 @@ def main(argv=None):
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS,
                         help="output directory (repository-relative)")
     add_solver_option_arguments(parser)
+    add_vascular_coupling_arguments(parser)
     args = parser.parse_args(argv)
     if args.mesh is not None and args.acinar_metadata is None:
         parser.error("--mesh and --acinar-metadata must be given together")
+    apply_vascular_coupling_args(args, parser)
     select_geometry(args.geometry, args.mesh, args.marker_json, args.acinar_metadata)
     SOLVER_OPTIONS = solver_options_from_args(args)
     LEGACY_PERIODIC_TOLERANCE = args.legacy_periodic_tolerance
